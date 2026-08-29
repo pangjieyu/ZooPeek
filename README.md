@@ -34,7 +34,7 @@ Pre-built installers are available on the [Releases](https://github.com/PangJayo
 
 | Platform | Package |
 |---|---|
-| Windows | `.msi` / `.exe` |
+| Windows | `.msi` / `.exe` / `portable.zip`（免安装，需系统自带 WebView2） |
 | macOS | `.dmg` (Apple Silicon & Intel) |
 | Linux | `.AppImage` / `.deb` |
 
