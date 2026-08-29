@@ -1,336 +1,560 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, ref } from "vue";
-import { invoke } from "@tauri-apps/api/core";
+import { onMounted, onUnmounted, reactive, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
+import {
+  darkTheme,
+  NAlert,
+  NButton,
+  NConfigProvider,
+  NEmpty,
+  NForm,
+  NFormItem,
+  NInput,
+  NLayout,
+  NLayoutContent,
+  NLayoutSider,
+  NList,
+  NListItem,
+  NModal,
+  NPopconfirm,
+  NScrollbar,
+  NSpace,
+  NTabPane,
+  NTabs,
+  NTag,
+  NText,
+  NTree,
+} from "naive-ui";
+import {
+  closeTab,
+  deleteSavedConnection,
+  disconnectConnection,
+  formatJsonDraft,
+  handleNodeEvent,
+  handleSessionState,
+  loadSavedConnections,
+  loadTreeNode,
+  openConnection,
+  saveConnection,
+  saveNodeData,
+  selectNode,
+  store,
+  updateExpandedKeys,
+  type NodeEvent,
+  type SavedConnection,
+  type SessionStateEvent,
+} from "./store";
 
-interface NodeEvent {
-  event_type: string;
-  path: string;
-  zxid: number;
+const showNewConnection = ref(false);
+const modalError = ref("");
+const appError = ref("");
+const newConnection = reactive({ name: "", servers: "127.0.0.1:2181" });
+const unlisteners: UnlistenFn[] = [];
+
+const statusLabels: Record<string, string> = {
+  Connecting: "连接中",
+  SyncConnected: "已连接",
+  ConnectedReadOnly: "只读连接",
+  Disconnected: "已断开",
+  Expired: "会话过期",
+  AuthFailed: "认证失败",
+  Closed: "已关闭",
+  SaslAuthenticated: "SASL 已认证",
+};
+
+function statusLabel(status: string): string {
+  return statusLabels[status] ?? status;
 }
 
-const servers = ref("127.0.0.1:2181");
-const connected = ref(false);
-const connecting = ref(false);
-const sessionState = ref("CLOSED");
-const sessionId = ref("");
-const errorMsg = ref("");
-
-const currentPath = ref("/");
-const children = ref<string[]>([]);
-const selectedPath = ref("");
-const nodeData = ref("");
-const events = ref<string[]>([]);
-
-let unlisteners: UnlistenFn[] = [];
-
-function logEvent(text: string) {
-  const time = new Date().toLocaleTimeString();
-  events.value.unshift(`[${time}] ${text}`);
-  if (events.value.length > 100) events.value.pop();
+function statusType(
+  status: string
+): "default" | "error" | "info" | "success" | "warning" {
+  if (status === "SyncConnected") return "success";
+  if (status === "Connecting") return "warning";
+  if (status === "ConnectedReadOnly" || status === "SaslAuthenticated") {
+    return "info";
+  }
+  if (status === "Expired" || status === "AuthFailed") return "error";
+  return "default";
 }
 
-async function doConnect() {
-  connecting.value = true;
-  errorMsg.value = "";
-  sessionState.value = "CONNECTING";
+async function createConnection(): Promise<void> {
+  modalError.value = "";
+  const name = newConnection.name.trim();
+  const servers = newConnection.servers.trim();
+  if (!name || !servers) {
+    modalError.value = "名称和地址不能为空";
+    return;
+  }
+  const connection: SavedConnection = {
+    id:
+      globalThis.crypto?.randomUUID?.() ??
+      `connection-${Date.now().toString(36)}`,
+    name,
+    servers,
+  };
   try {
-    const result = await invoke<{ session_id: string }>("connect", {
-      servers: servers.value,
-    });
-    connected.value = true;
-    sessionId.value = result.session_id;
-    logEvent(`已连接，session id = ${result.session_id}`);
-    await refreshChildren();
-  } catch (e) {
-    errorMsg.value = String(e);
-    sessionState.value = "CLOSED";
-    logEvent(`连接失败: ${e}`);
-  } finally {
-    connecting.value = false;
+    await saveConnection(connection);
+    showNewConnection.value = false;
+    newConnection.name = "";
+    await openConnection(connection);
+  } catch (error) {
+    modalError.value = String(error);
   }
 }
 
-async function refreshChildren() {
-  // watch_children 返回当前子节点并挂一次性 watcher
-  children.value = await invoke<string[]>("watch_children", {
-    path: currentPath.value,
-  });
-}
-
-async function enterDir(name: string) {
-  currentPath.value =
-    currentPath.value === "/"
-      ? `/${name}`
-      : `${currentPath.value}/${name}`;
-  selectedPath.value = "";
-  nodeData.value = "";
-  await refreshChildren();
-}
-
-async function goParent() {
-  if (currentPath.value === "/") return;
-  const idx = currentPath.value.lastIndexOf("/");
-  currentPath.value = idx === 0 ? "/" : currentPath.value.slice(0, idx);
-  selectedPath.value = "";
-  nodeData.value = "";
-  await refreshChildren();
-}
-
-function fullPath(name: string): string {
-  return currentPath.value === "/"
-    ? `/${name}`
-    : `${currentPath.value}/${name}`;
-}
-
-async function selectNode(name: string) {
-  selectedPath.value = fullPath(name);
-  // watch_data 返回数据并挂数据 watcher
-  nodeData.value = await invoke<string>("watch_data", {
-    path: selectedPath.value,
-  });
+async function removeSavedConnection(id: string): Promise<void> {
+  try {
+    await deleteSavedConnection(id);
+  } catch (error) {
+    appError.value = String(error);
+  }
 }
 
 onMounted(async () => {
-  unlisteners.push(
-    await listen<string>("zk-session-state", (e) => {
-      sessionState.value = e.payload;
-      logEvent(`会话状态变更: ${e.payload}`);
-    }),
-    await listen<NodeEvent>("zk-node-event", async (e) => {
-      logEvent(
-        `节点事件: ${e.payload.event_type} path=${e.payload.path} zxid=${e.payload.zxid}`
-      );
-      // 一次性 watcher 触发后刷新并重新挂 watch
-      if (
-        e.payload.event_type === "NodeChildrenChanged" &&
-        e.payload.path === currentPath.value
-      ) {
-        await refreshChildren();
-      }
-      if (
-        e.payload.event_type === "NodeDataChanged" &&
-        e.payload.path === selectedPath.value
-      ) {
-        nodeData.value = await invoke<string>("watch_data", {
-          path: selectedPath.value,
-        });
-      }
-    })
-  );
+  try {
+    unlisteners.push(
+      await listen<SessionStateEvent>("zk-session-state", (event) => {
+        void handleSessionState(event.payload);
+      }),
+      await listen<NodeEvent>("zk-node-event", (event) => {
+        void handleNodeEvent(event.payload);
+      })
+    );
+    await loadSavedConnections();
+  } catch (error) {
+    appError.value = String(error);
+  }
 });
 
 onUnmounted(() => {
-  unlisteners.forEach((u) => u());
+  unlisteners.forEach((unlisten) => unlisten());
 });
 </script>
 
 <template>
-  <main class="app">
-    <header class="toolbar">
-      <span class="logo">🦦 ZooPeek</span>
-      <input v-model="servers" :disabled="connected" placeholder="host:2181" />
-      <button v-if="!connected" :disabled="connecting" @click="doConnect">
-        {{ connecting ? "连接中..." : "连接" }}
-      </button>
-      <span class="badge" :class="sessionState.toLowerCase()">
-        {{ sessionState }}
-      </span>
-      <span v-if="sessionId" class="session">{{ sessionId }}</span>
-    </header>
-
-    <p v-if="errorMsg" class="error">{{ errorMsg }}</p>
-
-    <div v-if="connected" class="body">
-      <section class="tree">
-        <div class="path-bar">
-          <button :disabled="currentPath === '/'" @click="goParent">⬆</button>
-          <code>{{ currentPath }}</code>
+  <n-config-provider :theme="darkTheme">
+    <n-layout has-sider class="app-shell">
+      <n-layout-sider bordered :width="280" content-style="padding: 16px;">
+        <div class="brand-row">
+          <div>
+            <div class="brand">ZooPeek</div>
+            <n-text depth="3">ZooKeeper 客户端</n-text>
+          </div>
+          <n-button type="primary" size="small" @click="showNewConnection = true">
+            新建
+          </n-button>
         </div>
-        <ul>
-          <li
-            v-for="c in children"
-            :key="c"
-            :class="{ selected: selectedPath === fullPath(c) }"
+
+        <n-alert v-if="appError" type="error" closable @close="appError = ''">
+          {{ appError }}
+        </n-alert>
+
+        <div class="section-title">已保存连接</div>
+        <n-scrollbar class="connection-list-scroll">
+          <n-list v-if="store.savedConnections.length" hoverable clickable>
+            <n-list-item
+              v-for="connection in store.savedConnections"
+              :key="connection.id"
+              @click="openConnection(connection)"
+            >
+              <div class="connection-item">
+                <strong>{{ connection.name }}</strong>
+                <n-text depth="3">{{ connection.servers }}</n-text>
+              </div>
+              <template #suffix>
+                <n-popconfirm
+                  positive-text="删除"
+                  negative-text="取消"
+                  @positive-click="removeSavedConnection(connection.id)"
+                >
+                  <template #trigger>
+                    <n-button text type="error" @click.stop>删除</n-button>
+                  </template>
+                  删除这个连接配置？已打开的连接不会关闭。
+                </n-popconfirm>
+              </template>
+            </n-list-item>
+          </n-list>
+          <n-empty v-else description="还没有保存的连接" />
+        </n-scrollbar>
+      </n-layout-sider>
+
+      <n-layout-content class="main-content">
+        <n-tabs
+          v-if="store.tabs.length"
+          v-model:value="store.activeTabId"
+          type="card"
+          closable
+          class="connection-tabs"
+          @close="(id) => closeTab(String(id))"
+        >
+          <n-tab-pane
+            v-for="tab in store.tabs"
+            :key="tab.id"
+            :name="tab.id"
+            :tab="tab.name"
+            display-directive="show"
           >
-            <span class="name" @click="selectNode(c)">{{ c }}</span>
-            <button class="enter" @click="enterDir(c)">→</button>
-          </li>
-          <li v-if="children.length === 0" class="empty">（空节点）</li>
-        </ul>
-      </section>
+            <div class="tab-body">
+              <div class="status-bar">
+                <n-space align="center">
+                  <n-tag :type="statusType(tab.status)" round>
+                    {{ statusLabel(tab.status) }}
+                  </n-tag>
+                  <n-text depth="3">{{ tab.servers }}</n-text>
+                  <n-text v-if="tab.sessionId" depth="3">
+                    Session ID：{{ tab.sessionId }}
+                  </n-text>
+                </n-space>
+                <n-button
+                  size="small"
+                  secondary
+                  type="warning"
+                  :disabled="tab.status === 'Disconnected'"
+                  @click="disconnectConnection(tab)"
+                >
+                  断开
+                </n-button>
+              </div>
 
-      <section class="detail">
-        <h3>{{ selectedPath || "（点击节点名查看数据）" }}</h3>
-        <pre v-if="selectedPath">{{ nodeData || "（无数据）" }}</pre>
-      </section>
-    </div>
+              <n-alert
+                v-if="tab.error"
+                type="error"
+                closable
+                @close="tab.error = ''"
+              >
+                {{ tab.error }}
+              </n-alert>
 
-    <section class="events">
-      <h4>事件流</h4>
-      <ul>
-        <li v-for="(e, i) in events" :key="i">{{ e }}</li>
-      </ul>
-    </section>
-  </main>
+              <div class="workspace">
+                <section class="tree-pane panel">
+                  <div class="panel-title">节点树</div>
+                  <n-scrollbar class="tree-scroll">
+                    <n-tree
+                      block-line
+                      show-line
+                      :data="tab.tree"
+                      :expanded-keys="tab.expandedKeys"
+                      :selected-keys="tab.selectedPath ? [tab.selectedPath] : []"
+                      :on-load="(option) => loadTreeNode(tab, option)"
+                      @update:expanded-keys="
+                        (keys) => updateExpandedKeys(tab, keys)
+                      "
+                      @update:selected-keys="(keys) => selectNode(tab, keys)"
+                    />
+                  </n-scrollbar>
+                </section>
+
+                <section class="detail-pane panel">
+                  <div class="panel-title detail-title">
+                    <span>节点详情</span>
+                    <n-text v-if="tab.selectedNode" code class="detail-path">
+                      {{ tab.selectedPath }}
+                    </n-text>
+                  </div>
+                  <n-scrollbar class="detail-scroll">
+                    <template v-if="tab.selectedNode">
+                      <!-- 元数据压缩为一行小字，主体留给数据编辑器 -->
+                      <n-text depth="3" class="meta-line">
+                        长度 {{ tab.selectedNode.data_length }} · 版本
+                        {{ tab.selectedNode.version }} · 子版本
+                        {{ tab.selectedNode.cversion }} · 子节点
+                        {{ tab.selectedNode.num_children }} ·
+                        {{ tab.selectedNode.is_ephemeral ? "临时节点" : "持久节点" }}
+                      </n-text>
+                      <n-alert
+                        v-if="tab.selectedNode.is_binary"
+                        type="warning"
+                        class="binary-alert"
+                      >
+                        该节点为二进制数据，当前为 UTF-8 有损展示，已禁止编辑以防保存损坏原始字节
+                      </n-alert>
+                      <div class="editor-actions">
+                        <n-button
+                          size="small"
+                          secondary
+                          :disabled="tab.selectedNode.is_binary"
+                          @click="formatJsonDraft(tab)"
+                        >
+                          格式化 JSON
+                        </n-button>
+                        <n-button
+                          size="small"
+                          type="primary"
+                          :loading="tab.saving"
+                          :disabled="tab.selectedNode.is_binary"
+                          @click="saveNodeData(tab)"
+                        >
+                          保存数据
+                        </n-button>
+                      </div>
+                      <n-input
+                        v-model:value="tab.dataDraft"
+                        type="textarea"
+                        class="data-editor"
+                        :readonly="tab.selectedNode.is_binary"
+                        :autosize="{ minRows: 14, maxRows: 26 }"
+                        placeholder="节点无数据"
+                      />
+                    </template>
+                    <n-empty v-else description="请选择一个节点查看详情" />
+                  </n-scrollbar>
+                </section>
+              </div>
+
+              <section class="event-pane panel">
+                <div class="panel-title">事件流</div>
+                <n-scrollbar class="event-scroll">
+                  <div v-if="tab.events.length" class="event-list">
+                    <div v-for="event in tab.events" :key="event.id" class="event-row">
+                      <span class="event-time">{{ event.time }}</span>
+                      <span>{{ event.text }}</span>
+                    </div>
+                  </div>
+                  <n-empty v-else size="small" description="暂无事件" />
+                </n-scrollbar>
+              </section>
+            </div>
+          </n-tab-pane>
+        </n-tabs>
+
+        <div v-else class="welcome">
+          <n-empty description="从左侧选择或新建一个 ZooKeeper 连接" />
+        </div>
+      </n-layout-content>
+    </n-layout>
+
+    <n-modal
+      v-model:show="showNewConnection"
+      preset="card"
+      title="新建连接"
+      :style="{ width: '480px' }"
+    >
+      <n-form label-placement="top">
+        <n-form-item label="连接名称" required>
+          <n-input v-model:value="newConnection.name" placeholder="例如：本地开发环境" />
+        </n-form-item>
+        <n-form-item label="ZooKeeper 地址" required>
+          <n-input
+            v-model:value="newConnection.servers"
+            placeholder="127.0.0.1:2181"
+          />
+        </n-form-item>
+        <n-alert v-if="modalError" type="error">{{ modalError }}</n-alert>
+      </n-form>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showNewConnection = false">取消</n-button>
+          <n-button type="primary" @click="createConnection">保存并连接</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+  </n-config-provider>
 </template>
 
 <style>
 :root {
   color-scheme: dark;
-  font-family: -apple-system, "PingFang SC", sans-serif;
+  font-family: -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei",
+    sans-serif;
 }
-body {
+
+html,
+body,
+#app {
+  width: 100%;
+  height: 100%;
   margin: 0;
-  background: #1e1f24;
-  color: #d8d9dd;
 }
-.app {
-  display: flex;
-  flex-direction: column;
+
+body {
+  overflow: hidden;
+}
+
+.app-shell {
   height: 100vh;
-  padding: 12px;
-  box-sizing: border-box;
-  gap: 10px;
 }
-.toolbar {
+
+.brand-row,
+.status-bar {
   display: flex;
   align-items: center;
-  gap: 10px;
+  justify-content: space-between;
+  gap: 12px;
 }
-.logo {
+
+.brand {
+  font-size: 21px;
   font-weight: 700;
-  font-size: 18px;
+  letter-spacing: 0.3px;
 }
-.toolbar input {
-  flex: 0 0 220px;
-  padding: 6px 10px;
-  border-radius: 6px;
-  border: 1px solid #444;
-  background: #2a2b31;
-  color: inherit;
+
+.section-title,
+.panel-title,
+.editor-title {
+  font-weight: 600;
+  color: rgba(255, 255, 255, 0.82);
 }
-.toolbar button,
-.path-bar button,
-.enter {
-  padding: 6px 14px;
-  border-radius: 6px;
-  border: none;
-  background: #4f7cff;
-  color: white;
-  cursor: pointer;
+
+.section-title {
+  margin: 24px 0 10px;
+  font-size: 13px;
 }
-.toolbar button:disabled {
-  background: #555;
-  cursor: default;
+
+.connection-list-scroll {
+  max-height: calc(100vh - 135px);
 }
-.badge {
-  padding: 3px 10px;
-  border-radius: 10px;
-  font-size: 12px;
-  background: #555;
-}
-.badge.syncconnected,
-.badge.connectedreadonly {
-  background: #2b8a3e;
-}
-.badge.connecting,
-.badge.disconnected {
-  background: #e8a33d;
-  color: #222;
-}
-.badge.expired,
-.badge.closed,
-.badge.authfailed {
-  background: #c92a2a;
-}
-.session {
-  font-size: 12px;
-  color: #888;
-}
-.error {
-  color: #ff6b6b;
-  margin: 0;
-}
-.body {
+
+.connection-item {
   display: flex;
-  gap: 10px;
+  min-width: 0;
+  flex-direction: column;
+  gap: 3px;
+}
+
+.connection-item .n-text {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.main-content,
+.connection-tabs {
+  height: 100vh;
+}
+
+.connection-tabs > .n-tabs-pane-wrapper {
+  height: calc(100vh - 46px);
+}
+
+.tab-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  height: calc(100vh - 70px);
+  padding: 0 16px 16px;
+  box-sizing: border-box;
+}
+
+.status-bar {
+  flex: none;
+  min-height: 34px;
+}
+
+.tab-body > .n-alert {
+  flex: none;
+}
+
+.workspace {
+  display: grid;
+  flex: 1;
+  min-height: 0;
+  grid-template-columns: minmax(260px, 35%) minmax(400px, 1fr);
+  gap: 12px;
+}
+
+.panel {
+  min-height: 0;
+  padding: 14px;
+  border: 1px solid rgba(255, 255, 255, 0.09);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.025);
+  box-sizing: border-box;
+}
+
+.tree-pane,
+.detail-pane,
+.event-pane {
+  display: flex;
+  flex-direction: column;
+}
+
+.panel-title {
+  margin-bottom: 12px;
+  font-size: 14px;
+}
+
+.tree-scroll {
   flex: 1;
   min-height: 0;
 }
-.tree {
-  flex: 0 0 320px;
-  background: #26272d;
-  border-radius: 8px;
-  padding: 8px;
-  overflow-y: auto;
+
+.detail-scroll {
+  flex: 1;
+  min-height: 0;
 }
-.path-bar {
+
+/* 让树随最宽节点撑开：横向滚动时高亮块覆盖完整宽度 */
+.tree-scroll .n-tree {
+  width: max-content;
+  min-width: 100%;
+}
+
+.detail-title {
   display: flex;
   align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
+  gap: 10px;
+  min-width: 0;
 }
-.path-bar code {
-  color: #8ab4f8;
+
+.detail-path {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.tree ul,
-.events ul {
-  list-style: none;
-  margin: 0;
-  padding: 0;
+
+.meta-line {
+  display: block;
+  margin-bottom: 10px;
+  font-size: 12px;
 }
-.tree li {
+
+.data-editor {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+}
+
+.binary-alert {
+  margin-bottom: 10px;
+}
+
+.editor-actions {
   display: flex;
-  justify-content: space-between;
-  padding: 4px 8px;
-  border-radius: 4px;
+  justify-content: flex-end;
+  gap: 8px;
+  margin-bottom: 10px;
 }
-.tree li:hover {
-  background: #33343b;
+
+.event-pane {
+  flex: none;
+  height: 180px;
 }
-.tree li.selected {
-  background: #39415a;
-}
-.tree .name {
-  cursor: pointer;
+
+.event-scroll {
   flex: 1;
+  min-height: 0;
 }
-.enter {
-  padding: 0 8px;
+
+.event-list {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   font-size: 12px;
-  background: #444;
 }
-.empty {
-  color: #777;
+
+.event-row {
+  display: flex;
+  gap: 12px;
+  padding: 4px 2px;
+  line-height: 1.5;
 }
-.detail {
-  flex: 1;
-  background: #26272d;
-  border-radius: 8px;
-  padding: 8px 14px;
-  overflow: auto;
+
+.event-time {
+  flex: 0 0 auto;
+  color: #7e8a9a;
 }
-.detail pre {
-  white-space: pre-wrap;
-  word-break: break-all;
-  color: #b5e0a8;
-}
-.events {
-  flex: 0 0 160px;
-  background: #26272d;
-  border-radius: 8px;
-  padding: 8px 14px;
-  overflow-y: auto;
-}
-.events h4 {
-  margin: 4px 0;
-  color: #999;
-}
-.events li {
-  font-size: 12px;
-  font-family: monospace;
-  color: #9ecbff;
-  padding: 1px 0;
+
+.welcome {
+  display: grid;
+  height: 100%;
+  place-items: center;
 }
 </style>
