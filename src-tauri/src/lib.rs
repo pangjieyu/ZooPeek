@@ -97,6 +97,46 @@ struct NodeResult {
     is_binary: bool,
 }
 
+#[derive(Deserialize, Serialize)]
+struct AclEntry {
+    scheme: String,
+    id: String,
+    perms: i32,
+}
+
+fn permission_from_bits(bits: i32) -> Result<zk::Permission, String> {
+    if !(0..=31).contains(&bits) {
+        return Err(format!("无效的 ACL 权限值：{bits}"));
+    }
+
+    let mut permission = zk::Permission::NONE;
+    for (bit, value) in [
+        (1, zk::Permission::READ),
+        (2, zk::Permission::WRITE),
+        (4, zk::Permission::CREATE),
+        (8, zk::Permission::DELETE),
+        (16, zk::Permission::ADMIN),
+    ] {
+        if bits & bit != 0 {
+            permission = permission | value;
+        }
+    }
+    Ok(permission)
+}
+
+fn permission_bits(permission: zk::Permission) -> i32 {
+    [
+        (1, zk::Permission::READ),
+        (2, zk::Permission::WRITE),
+        (4, zk::Permission::CREATE),
+        (8, zk::Permission::DELETE),
+        (16, zk::Permission::ADMIN),
+    ]
+    .into_iter()
+    .filter_map(|(bit, value)| permission.has(value).then_some(bit))
+    .sum()
+}
+
 impl NodeResult {
     fn from_data_and_stat(data: Vec<u8>, stat: zk::Stat) -> Self {
         Self {
@@ -265,9 +305,14 @@ async fn create_node(
     } else {
         format!("{}/{name}", parent_path.trim_end_matches('/'))
     };
-    let options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
-    manager
-        .client(&conn_id)?
+    let client = manager.client(&conn_id)?;
+    // ZooKeeper ACL 不会继承；显式复制父节点 ACL，避免新节点意外变成 world:anyone:ALL。
+    let (parent_acl, _) = client
+        .get_acl(&parent_path)
+        .await
+        .map_err(|error| error.to_string())?;
+    let options = zk::CreateMode::Persistent.with_acls(zk::Acls::new(&parent_acl));
+    client
         .create(&path, data.as_bytes(), &options)
         .await
         .map_err(|error| error.to_string())?;
@@ -293,6 +338,118 @@ async fn delete_node(
     }
     client
         .delete(&path, None)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(())
+}
+
+pub async fn delete_node_tree(client: &zk::Client, path: &str) -> Result<u32, String> {
+    const MAX_NOT_EMPTY_RETRIES: u8 = 8;
+
+    let mut stack = vec![(path.to_string(), false, 0_u8)];
+    let mut deleted = 0;
+    while let Some((current, children_visited, retry_count)) = stack.pop() {
+        if children_visited {
+            match client.delete(&current, None).await {
+                Ok(()) => deleted += 1,
+                Err(zk::Error::NoNode) => {}
+                Err(zk::Error::NotEmpty) if retry_count < MAX_NOT_EMPTY_RETRIES => {
+                    match client.list_children(&current).await {
+                        Ok(children) => {
+                            // 遍历后可能并发新增子节点；重新压栈并继续自底向上删除。
+                            stack.push((current.clone(), true, retry_count + 1));
+                            for child in children {
+                                let child_path =
+                                    format!("{}/{child}", current.trim_end_matches('/'));
+                                stack.push((child_path, false, 0));
+                            }
+                        }
+                        // NotEmpty 后节点可能已被另一个客户端删掉，目标状态已经达成。
+                        Err(zk::Error::NoNode) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                Err(zk::Error::NotEmpty) => {
+                    return Err(format!(
+                        "递归删除部分完成：已删除 {deleted} 个节点；{current} 持续出现新子节点"
+                    ));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            continue;
+        }
+
+        match client.list_children(&current).await {
+            Ok(children) => {
+                stack.push((current.clone(), true, retry_count));
+                for child in children {
+                    let child_path = format!("{}/{child}", current.trim_end_matches('/'));
+                    stack.push((child_path, false, 0));
+                }
+            }
+            Err(zk::Error::NoNode) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(deleted)
+}
+
+#[tauri::command]
+async fn delete_node_recursive(
+    manager: State<'_, ConnectionManager>,
+    conn_id: String,
+    path: String,
+) -> Result<u32, String> {
+    if path == "/" {
+        return Err("不能删除根节点".to_string());
+    }
+    let client = manager.client(&conn_id)?;
+    delete_node_tree(&client, &path).await
+}
+
+#[tauri::command]
+async fn get_acl(
+    manager: State<'_, ConnectionManager>,
+    conn_id: String,
+    path: String,
+) -> Result<Vec<AclEntry>, String> {
+    let (acl, _) = manager
+        .client(&conn_id)?
+        .get_acl(&path)
+        .await
+        .map_err(|error| error.to_string())?;
+    Ok(acl
+        .into_iter()
+        .map(|entry| AclEntry {
+            scheme: entry.scheme().to_string(),
+            id: entry.id().to_string(),
+            perms: permission_bits(entry.permission()),
+        })
+        .collect())
+}
+
+#[tauri::command]
+async fn set_acl(
+    manager: State<'_, ConnectionManager>,
+    conn_id: String,
+    path: String,
+    acl: Vec<AclEntry>,
+) -> Result<(), String> {
+    if acl.is_empty() {
+        return Err("ACL 列表不能为空".to_string());
+    }
+    let acl = acl
+        .into_iter()
+        .map(|entry| {
+            Ok(zk::Acl::new(
+                permission_from_bits(entry.perms)?,
+                zk::AuthId::new(&entry.scheme, &entry.id),
+            ))
+        })
+        .collect::<Result<Vec<_>, String>>()?;
+    manager
+        .client(&conn_id)?
+        .set_acl(&path, &acl, None)
         .await
         .map_err(|error| error.to_string())?;
     Ok(())
@@ -429,6 +586,9 @@ pub fn run() {
             set_data,
             create_node,
             delete_node,
+            delete_node_recursive,
+            get_acl,
+            set_acl,
             watch_children,
             watch_data,
             save_connection,
