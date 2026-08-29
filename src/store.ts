@@ -1,6 +1,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import { reactive } from "vue";
 import type { TreeOption } from "naive-ui";
+import { ancestorPaths } from "./zk-path";
 
 export interface SavedConnection {
   id: string;
@@ -238,6 +239,7 @@ export async function selectNode(
       tab.dataDraft = "";
       tab.aclDraft = [];
       tab.newAcl = newAclEntry();
+      tab.aclLoading = false;
     } else {
       tab.error = String(error);
     }
@@ -326,13 +328,17 @@ function isNoNodeError(error: unknown): boolean {
   return String(error).includes("node not exists");
 }
 
-/** 节点被删除后回选其父节点（父节点必然存在，根节点不可删）。 */
-async function selectParentAfterDelete(
+/** 节点删除后选择最近仍存在的祖先，兼容外部递归删除的事件延迟。 */
+async function selectAncestorAfterDelete(
   tab: ConnectionTab,
   deletedPath: string
 ): Promise<void> {
-  const parentPath = deletedPath.slice(0, deletedPath.lastIndexOf("/")) || "/";
-  await selectNode(tab, [parentPath]);
+  for (const candidate of ancestorPaths(deletedPath)) {
+    await selectNode(tab, [candidate]);
+    if (tab.selectedNode) return;
+    // NoNode 会清空 selectedPath；其他错误保留路径和错误信息，不应继续回溯。
+    if (tab.selectedPath) return;
+  }
 }
 
 export async function deleteTreeNode(
@@ -348,7 +354,7 @@ export async function deleteTreeNode(
     : await invoke("delete_node", { connId: tab.id, path }).then(() => 1);
   appendEvent(tab, `已删除节点：${path}（共 ${deleted} 个）`);
   if (shouldSelectParent) {
-    await selectParentAfterDelete(tab, path);
+    await selectAncestorAfterDelete(tab, path);
   }
   return deleted;
 }
@@ -517,8 +523,8 @@ export async function handleNodeEvent(event: NodeEvent): Promise<void> {
       event.event_type === "NodeDeleted" &&
       tab.selectedPath === event.path
     ) {
-      // 外部删除当前选中节点：同样回上一级
-      await selectParentAfterDelete(tab, event.path);
+      // 外部递归删除可能已移除多级父节点，回溯到最近仍存在的祖先。
+      await selectAncestorAfterDelete(tab, event.path);
     }
   } catch (error) {
     tab.error = String(error);
