@@ -343,6 +343,57 @@ async fn delete_node(
     Ok(())
 }
 
+pub async fn delete_node_tree(client: &zk::Client, path: &str) -> Result<u32, String> {
+    const MAX_NOT_EMPTY_RETRIES: u8 = 8;
+
+    let mut stack = vec![(path.to_string(), false, 0_u8)];
+    let mut deleted = 0;
+    while let Some((current, children_visited, retry_count)) = stack.pop() {
+        if children_visited {
+            match client.delete(&current, None).await {
+                Ok(()) => deleted += 1,
+                Err(zk::Error::NoNode) => {}
+                Err(zk::Error::NotEmpty) if retry_count < MAX_NOT_EMPTY_RETRIES => {
+                    match client.list_children(&current).await {
+                        Ok(children) => {
+                            // 遍历后可能并发新增子节点；重新压栈并继续自底向上删除。
+                            stack.push((current.clone(), true, retry_count + 1));
+                            for child in children {
+                                let child_path =
+                                    format!("{}/{child}", current.trim_end_matches('/'));
+                                stack.push((child_path, false, 0));
+                            }
+                        }
+                        // NotEmpty 后节点可能已被另一个客户端删掉，目标状态已经达成。
+                        Err(zk::Error::NoNode) => {}
+                        Err(error) => return Err(error.to_string()),
+                    }
+                }
+                Err(zk::Error::NotEmpty) => {
+                    return Err(format!(
+                        "递归删除部分完成：已删除 {deleted} 个节点；{current} 持续出现新子节点"
+                    ));
+                }
+                Err(error) => return Err(error.to_string()),
+            }
+            continue;
+        }
+
+        match client.list_children(&current).await {
+            Ok(children) => {
+                stack.push((current.clone(), true, retry_count));
+                for child in children {
+                    let child_path = format!("{}/{child}", current.trim_end_matches('/'));
+                    stack.push((child_path, false, 0));
+                }
+            }
+            Err(zk::Error::NoNode) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    Ok(deleted)
+}
+
 #[tauri::command]
 async fn delete_node_recursive(
     manager: State<'_, ConnectionManager>,
@@ -352,32 +403,8 @@ async fn delete_node_recursive(
     if path == "/" {
         return Err("不能删除根节点".to_string());
     }
-
     let client = manager.client(&conn_id)?;
-    let mut stack = vec![(path, false)];
-    let mut deleted = 0;
-    while let Some((current, children_visited)) = stack.pop() {
-        if children_visited {
-            client
-                .delete(&current, None)
-                .await
-                .map_err(|error| error.to_string())?;
-            deleted += 1;
-            continue;
-        }
-
-        let children = client
-            .list_children(&current)
-            .await
-            .map_err(|error| error.to_string())?;
-        // 当前节点第二次出栈时，其全部子节点都已经删除。
-        stack.push((current.clone(), true));
-        for child in children {
-            let child_path = format!("{}/{child}", current.trim_end_matches('/'));
-            stack.push((child_path, false));
-        }
-    }
-    Ok(deleted)
+    delete_node_tree(&client, &path).await
 }
 
 #[tauri::command]
