@@ -90,7 +90,7 @@ MIT
 
 ### 核心特性
 
-- **轻量快速**：安装包约 10MB，秒级启动，低内存占用（无 JVM、不打包 Chromium）
+- **轻量快速**：安装包约 10MB，秒级启动，低内存占用
 - **跨平台**：Windows / macOS / Linux 原生安装包
 - **中间状态透明**：连接状态机实时可视（连接中/已连接/断开重连/会话过期），Session ID 可见，watcher 事件流实时滚动——永远知道客户端当前处于什么状态
 - **多连接管理**：tab 式多集群并行管理，体验对标 DataGrip
@@ -110,9 +110,6 @@ cd ZooPeek
 pnpm install
 pnpm tauri dev
 ```
-
-分支模型：日常开发在 `develop`，`main` 为保护分支，打 `v*` tag 自动构建三平台安装包并发布 Release。
-
 ### License
 
 MIT
