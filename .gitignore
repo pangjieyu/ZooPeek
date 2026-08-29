@@ -22,3 +22,6 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Tauri 应用图标不能被全局 Icon? 规则吞掉
+!src-tauri/icons/
