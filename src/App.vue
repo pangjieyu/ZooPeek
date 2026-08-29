@@ -1,11 +1,16 @@
 <script setup lang="ts">
-import { onMounted, onUnmounted, reactive, ref } from "vue";
+import { nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
   darkTheme,
   NAlert,
   NButton,
+  NCheckbox,
+  NCheckboxGroup,
+  NCollapse,
+  NCollapseItem,
   NConfigProvider,
+  NDropdown,
   NEmpty,
   NForm,
   NFormItem,
@@ -18,6 +23,7 @@ import {
   NModal,
   NPopconfirm,
   NScrollbar,
+  NSelect,
   NSpace,
   NTabPane,
   NTabs,
@@ -25,8 +31,12 @@ import {
   NText,
   NTree,
 } from "naive-ui";
+import type { DropdownOption, TreeOption } from "naive-ui";
 import {
+  addAclEntry,
   closeTab,
+  createChildNode,
+  deleteTreeNode,
   deleteSavedConnection,
   disconnectConnection,
   formatJsonDraft,
@@ -34,12 +44,17 @@ import {
   handleSessionState,
   loadSavedConnections,
   loadTreeNode,
+  listNodeChildren,
   openConnection,
+  removeAclEntry,
   saveConnection,
+  saveNodeAcl,
   saveNodeData,
   selectNode,
   store,
+  tabById,
   updateExpandedKeys,
+  type ConnectionTab,
   type NodeEvent,
   type SavedConnection,
   type SessionStateEvent,
@@ -50,6 +65,34 @@ const modalError = ref("");
 const appError = ref("");
 const newConnection = reactive({ name: "", servers: "127.0.0.1:2181" });
 const unlisteners: UnlistenFn[] = [];
+
+const treeMenu = reactive({
+  show: false,
+  x: 0,
+  y: 0,
+  tabId: "",
+  path: "",
+});
+const treeMenuOptions = ref<DropdownOption[]>([]);
+const showNewNode = ref(false);
+const creatingNode = ref(false);
+const nodeModalError = ref("");
+const newNode = reactive({ tabId: "", parentPath: "", name: "", data: "" });
+const showDeleteNode = ref(false);
+const deletingNode = ref(false);
+const deleteTarget = reactive({ tabId: "", path: "", recursive: false });
+
+const aclSchemeOptions = ["world", "auth", "digest", "ip"].map((value) => ({
+  label: value,
+  value,
+}));
+const aclPermissionOptions = [
+  { label: "R", value: 1 },
+  { label: "W", value: 2 },
+  { label: "C", value: 4 },
+  { label: "D", value: 8 },
+  { label: "A", value: 16 },
+];
 
 const statusLabels: Record<string, string> = {
   Connecting: "连接中",
@@ -109,6 +152,110 @@ async function removeSavedConnection(id: string): Promise<void> {
   } catch (error) {
     appError.value = String(error);
   }
+}
+
+function treeNodeProps(
+  tab: ConnectionTab,
+  { option }: { option: TreeOption }
+): Record<string, unknown> {
+  return {
+    onContextmenu: (event: MouseEvent) => {
+      event.preventDefault();
+      treeMenu.show = false;
+      treeMenu.tabId = tab.id;
+      treeMenu.path = String(option.key);
+      treeMenu.x = event.clientX;
+      treeMenu.y = event.clientY;
+      treeMenuOptions.value = [
+        { label: "新建子节点", key: "create" },
+        { label: "删除节点", key: "delete", disabled: option.key === "/" },
+      ];
+      void nextTick(() => {
+        treeMenu.show = true;
+      });
+    },
+  };
+}
+
+async function handleTreeMenuSelect(key: string | number): Promise<void> {
+  treeMenu.show = false;
+  const tab = tabById(treeMenu.tabId);
+  if (!tab) return;
+
+  if (key === "create") {
+    newNode.tabId = tab.id;
+    newNode.parentPath = treeMenu.path;
+    newNode.name = "";
+    newNode.data = "";
+    nodeModalError.value = "";
+    showNewNode.value = true;
+    return;
+  }
+
+  if (key === "delete" && treeMenu.path !== "/") {
+    tab.error = "";
+    try {
+      const children = await listNodeChildren(tab, treeMenu.path);
+      deleteTarget.tabId = tab.id;
+      deleteTarget.path = treeMenu.path;
+      deleteTarget.recursive = children.length > 0;
+      showDeleteNode.value = true;
+    } catch (error) {
+      tab.error = String(error);
+    }
+  }
+}
+
+async function submitNewNode(): Promise<void> {
+  const tab = tabById(newNode.tabId);
+  if (!tab) return;
+  const name = newNode.name.trim();
+  if (!name || name.includes("/")) {
+    nodeModalError.value = "节点名称不能为空且不能包含 /";
+    return;
+  }
+  creatingNode.value = true;
+  nodeModalError.value = "";
+  try {
+    await createChildNode(tab, newNode.parentPath, name, newNode.data);
+    showNewNode.value = false;
+  } catch (error) {
+    nodeModalError.value = String(error);
+  } finally {
+    creatingNode.value = false;
+  }
+}
+
+async function confirmDeleteNode(): Promise<void> {
+  const tab = tabById(deleteTarget.tabId);
+  if (!tab) return;
+  deletingNode.value = true;
+  tab.error = "";
+  try {
+    await deleteTreeNode(
+      tab,
+      deleteTarget.path,
+      deleteTarget.recursive
+    );
+    showDeleteNode.value = false;
+  } catch (error) {
+    tab.error = String(error);
+    showDeleteNode.value = false;
+  } finally {
+    deletingNode.value = false;
+  }
+}
+
+function changeAclScheme(tab: ConnectionTab, scheme: string): void {
+  tab.newAcl.scheme = scheme;
+  tab.newAcl.id = scheme === "world" ? "anyone" : "";
+}
+
+function aclPermissionLabel(permission: number): string {
+  return (
+    aclPermissionOptions.find((option) => option.value === permission)?.label ??
+    "?"
+  );
 }
 
 onMounted(async () => {
@@ -237,6 +384,7 @@ onUnmounted(() => {
                       :data="tab.tree"
                       :expanded-keys="tab.expandedKeys"
                       :selected-keys="tab.selectedPath ? [tab.selectedPath] : []"
+                      :node-props="(info) => treeNodeProps(tab, info)"
                       :on-load="(option) => loadTreeNode(tab, option)"
                       @update:expanded-keys="
                         (keys) => updateExpandedKeys(tab, keys)
@@ -297,6 +445,85 @@ onUnmounted(() => {
                         :autosize="{ minRows: 14, maxRows: 26 }"
                         placeholder="节点无数据"
                       />
+
+                      <n-collapse class="acl-collapse">
+                        <n-collapse-item title="ACL 权限" name="acl">
+                          <n-text v-if="tab.aclLoading" depth="3">
+                            正在加载 ACL…
+                          </n-text>
+                          <template v-else>
+                            <div v-if="tab.aclDraft.length" class="acl-list">
+                              <div
+                                v-for="(entry, index) in tab.aclDraft"
+                                :key="`${entry.scheme}:${entry.id}:${index}`"
+                                class="acl-row"
+                              >
+                                <n-text code>{{ entry.scheme }}:{{ entry.id }}</n-text>
+                                <n-space size="small" class="acl-tags">
+                                  <n-tag
+                                    v-for="permission in entry.permissions"
+                                    :key="permission"
+                                    size="small"
+                                    type="info"
+                                  >
+                                    {{ aclPermissionLabel(permission) }}
+                                  </n-tag>
+                                </n-space>
+                                <n-button
+                                  text
+                                  type="error"
+                                  @click="removeAclEntry(tab, index)"
+                                >
+                                  删除
+                                </n-button>
+                              </div>
+                            </div>
+                            <n-empty
+                              v-else
+                              size="small"
+                              description="ACL 列表为空"
+                            />
+
+                            <div class="acl-add-form">
+                              <n-select
+                                :value="tab.newAcl.scheme"
+                                :options="aclSchemeOptions"
+                                class="acl-scheme"
+                                @update:value="(value) => changeAclScheme(tab, value)"
+                              />
+                              <n-input
+                                v-model:value="tab.newAcl.id"
+                                placeholder="id"
+                              />
+                              <n-checkbox-group
+                                v-model:value="tab.newAcl.permissions"
+                                class="acl-checkboxes"
+                              >
+                                <n-checkbox
+                                  v-for="permission in aclPermissionOptions"
+                                  :key="permission.value"
+                                  :value="permission.value"
+                                  :label="permission.label"
+                                />
+                              </n-checkbox-group>
+                              <n-button @click="addAclEntry(tab)">新增条目</n-button>
+                            </div>
+                            <div class="acl-save-row">
+                              <n-text depth="3">
+                                保存会整体替换该节点当前 ACL
+                              </n-text>
+                              <n-button
+                                type="primary"
+                                size="small"
+                                :loading="tab.aclSaving"
+                                @click="saveNodeAcl(tab)"
+                              >
+                                保存 ACL
+                              </n-button>
+                            </div>
+                          </template>
+                        </n-collapse-item>
+                      </n-collapse>
                     </template>
                     <n-empty v-else description="请选择一个节点查看详情" />
                   </n-scrollbar>
@@ -347,6 +574,74 @@ onUnmounted(() => {
         <n-space justify="end">
           <n-button @click="showNewConnection = false">取消</n-button>
           <n-button type="primary" @click="createConnection">保存并连接</n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <n-dropdown
+      trigger="manual"
+      placement="bottom-start"
+      :show="treeMenu.show"
+      :x="treeMenu.x"
+      :y="treeMenu.y"
+      :options="treeMenuOptions"
+      :on-clickoutside="() => (treeMenu.show = false)"
+      @select="handleTreeMenuSelect"
+    />
+
+    <n-modal
+      v-model:show="showNewNode"
+      preset="card"
+      title="新建子节点"
+      :style="{ width: '520px' }"
+    >
+      <n-form label-placement="top">
+        <n-form-item label="父节点">
+          <n-text code>{{ newNode.parentPath }}</n-text>
+        </n-form-item>
+        <n-form-item label="节点名称" required>
+          <n-input v-model:value="newNode.name" placeholder="child" />
+        </n-form-item>
+        <n-form-item label="初始数据">
+          <n-input
+            v-model:value="newNode.data"
+            type="textarea"
+            :autosize="{ minRows: 5, maxRows: 12 }"
+            placeholder="可留空"
+          />
+        </n-form-item>
+        <n-alert v-if="nodeModalError" type="error">
+          {{ nodeModalError }}
+        </n-alert>
+      </n-form>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showNewNode = false">取消</n-button>
+          <n-button type="primary" :loading="creatingNode" @click="submitNewNode">
+            创建
+          </n-button>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <n-modal
+      v-model:show="showDeleteNode"
+      preset="card"
+      title="删除节点"
+      :style="{ width: '480px' }"
+    >
+      <n-alert :type="deleteTarget.recursive ? 'warning' : 'info'">
+        <template v-if="deleteTarget.recursive">
+          将递归删除该节点及全部子节点：{{ deleteTarget.path }}
+        </template>
+        <template v-else>确认删除节点：{{ deleteTarget.path }}？</template>
+      </n-alert>
+      <template #footer>
+        <n-space justify="end">
+          <n-button @click="showDeleteNode = false">取消</n-button>
+          <n-button type="error" :loading="deletingNode" @click="confirmDeleteNode">
+            删除
+          </n-button>
         </n-space>
       </template>
     </n-modal>
@@ -523,6 +818,49 @@ body {
   justify-content: flex-end;
   gap: 8px;
   margin-bottom: 10px;
+}
+
+.acl-collapse {
+  margin-top: 18px;
+}
+
+.acl-list {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+
+.acl-row {
+  display: grid;
+  grid-template-columns: minmax(140px, auto) 1fr auto;
+  align-items: center;
+  gap: 10px;
+}
+
+.acl-tags {
+  min-width: 0;
+}
+
+.acl-add-form {
+  display: grid;
+  grid-template-columns: 110px minmax(140px, 1fr) auto auto;
+  align-items: center;
+  gap: 10px;
+  margin-top: 14px;
+}
+
+.acl-checkboxes {
+  display: flex;
+  gap: 8px;
+  white-space: nowrap;
+}
+
+.acl-save-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-top: 14px;
 }
 
 .event-pane {
