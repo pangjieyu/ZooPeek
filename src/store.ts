@@ -18,6 +18,18 @@ export interface NodeDetail {
   is_binary: boolean;
 }
 
+export interface AclEntry {
+  scheme: string;
+  id: string;
+  perms: number;
+}
+
+export interface AclDraftEntry {
+  scheme: string;
+  id: string;
+  permissions: number[];
+}
+
 export interface ZkTreeOption extends TreeOption {
   key: string;
   label: string;
@@ -44,6 +56,10 @@ export interface ConnectionTab {
   selectedNode: NodeDetail | null;
   dataDraft: string;
   saving: boolean;
+  aclDraft: AclDraftEntry[];
+  newAcl: AclDraftEntry;
+  aclLoading: boolean;
+  aclSaving: boolean;
   events: EventItem[];
 }
 
@@ -82,6 +98,20 @@ function appendEvent(tab: ConnectionTab, text: string): void {
 
 function childPath(parentPath: string, name: string): string {
   return parentPath === "/" ? `/${name}` : `${parentPath}/${name}`;
+}
+
+function newAclEntry(): AclDraftEntry {
+  return {
+    scheme: "world",
+    id: "anyone",
+    permissions: [1, 2, 4, 8, 16],
+  };
+}
+
+function permissionValues(perms: number): number[] {
+  return [1, 2, 4, 8, 16].filter((permission) =>
+    Boolean(perms & permission)
+  );
 }
 
 function findTreeNode(
@@ -170,6 +200,9 @@ export async function selectNode(
   tab.selectedPath = path;
   tab.selectedNode = null;
   tab.dataDraft = "";
+  tab.aclDraft = [];
+  tab.newAcl = newAclEntry();
+  tab.aclLoading = Boolean(path);
   tab.error = "";
   if (!path) return;
 
@@ -183,9 +216,141 @@ export async function selectNode(
       tab.selectedNode = detail;
       tab.dataDraft = detail.data;
     }
+    if (tab.selectedPath !== path) return;
+
+    const acl = await invoke<AclEntry[]>("get_acl", {
+      connId: tab.id,
+      path,
+    });
+    if (tab.selectedPath === path) {
+      tab.aclDraft = acl.map((entry) => ({
+        scheme: entry.scheme,
+        id: entry.id,
+        permissions: permissionValues(entry.perms),
+      }));
+    }
+  } catch (error) {
+    if (tab.selectedPath !== path) return;
+    if (isNoNodeError(error)) {
+      // 节点刚被删除（本端或外部），静默取消选中而不是报错
+      tab.selectedPath = "";
+      tab.selectedNode = null;
+      tab.dataDraft = "";
+      tab.aclDraft = [];
+      tab.newAcl = newAclEntry();
+    } else {
+      tab.error = String(error);
+    }
+  } finally {
+    if (tab.selectedPath === path) tab.aclLoading = false;
+  }
+}
+
+export function addAclEntry(tab: ConnectionTab): void {
+  const entry = tab.newAcl;
+  if (!entry.scheme || (entry.scheme !== "auth" && !entry.id.trim())) {
+    tab.error = "ACL 的 scheme 和 id 不能为空";
+    return;
+  }
+  if (entry.permissions.length === 0) {
+    tab.error = "请至少选择一项 ACL 权限";
+    return;
+  }
+  tab.aclDraft.push({
+    scheme: entry.scheme,
+    id: entry.id.trim(),
+    permissions: [...entry.permissions],
+  });
+  tab.newAcl = newAclEntry();
+  tab.error = "";
+}
+
+export function removeAclEntry(tab: ConnectionTab, index: number): void {
+  tab.aclDraft.splice(index, 1);
+}
+
+export async function saveNodeAcl(tab: ConnectionTab): Promise<void> {
+  if (!tab.selectedPath) return;
+  if (tab.aclDraft.length === 0) {
+    tab.error = "ACL 列表不能为空";
+    return;
+  }
+  const path = tab.selectedPath;
+  tab.aclSaving = true;
+  tab.error = "";
+  try {
+    await invoke("set_acl", {
+      connId: tab.id,
+      path,
+      // set_acl 是整体替换，始终提交界面中的完整列表。
+      acl: tab.aclDraft.map((entry) => ({
+        scheme: entry.scheme,
+        id: entry.id,
+        perms: entry.permissions.reduce(
+          (sum, permission) => sum | permission,
+          0
+        ),
+      })),
+    });
+    appendEvent(tab, `已保存 ACL：${path}`);
   } catch (error) {
     tab.error = String(error);
+  } finally {
+    tab.aclSaving = false;
   }
+}
+
+export async function createChildNode(
+  tab: ConnectionTab,
+  parentPath: string,
+  name: string,
+  data: string
+): Promise<void> {
+  await invoke("create_node", {
+    connId: tab.id,
+    parentPath,
+    name,
+    data,
+  });
+  appendEvent(tab, `已新建节点：${childPath(parentPath, name)}`);
+}
+
+export async function listNodeChildren(
+  tab: ConnectionTab,
+  path: string
+): Promise<string[]> {
+  return invoke<string[]>("list_children", { connId: tab.id, path });
+}
+
+function isNoNodeError(error: unknown): boolean {
+  return String(error).includes("node not exists");
+}
+
+/** 节点被删除后回选其父节点（父节点必然存在，根节点不可删）。 */
+async function selectParentAfterDelete(
+  tab: ConnectionTab,
+  deletedPath: string
+): Promise<void> {
+  const parentPath = deletedPath.slice(0, deletedPath.lastIndexOf("/")) || "/";
+  await selectNode(tab, [parentPath]);
+}
+
+export async function deleteTreeNode(
+  tab: ConnectionTab,
+  path: string,
+  recursive: boolean
+): Promise<number> {
+  // 删除期间 watcher 可能改变 selectedPath，必须在请求前快照回选意图。
+  const shouldSelectParent =
+    tab.selectedPath === path || tab.selectedPath.startsWith(`${path}/`);
+  const deleted = recursive
+    ? await invoke<number>("delete_node_recursive", { connId: tab.id, path })
+    : await invoke("delete_node", { connId: tab.id, path }).then(() => 1);
+  appendEvent(tab, `已删除节点：${path}（共 ${deleted} 个）`);
+  if (shouldSelectParent) {
+    await selectParentAfterDelete(tab, path);
+  }
+  return deleted;
 }
 
 export async function saveNodeData(tab: ConnectionTab): Promise<void> {
@@ -246,6 +411,10 @@ export async function openConnection(
       selectedNode: null,
       dataDraft: "",
       saving: false,
+      aclDraft: [],
+      newAcl: newAclEntry(),
+      aclLoading: false,
+      aclSaving: false,
       events: [],
     });
     store.tabs.push(tab);
@@ -275,6 +444,9 @@ export async function openConnection(
   tab.selectedPath = "";
   tab.selectedNode = null;
   tab.dataDraft = "";
+  tab.aclDraft = [];
+  tab.newAcl = newAclEntry();
+  tab.aclLoading = false;
   appendEvent(tab, `正在连接 ${connection.servers}`);
   try {
     const result = await invoke<{ session_id: string }>("connect", {
@@ -331,10 +503,8 @@ export async function handleNodeEvent(event: NodeEvent): Promise<void> {
   );
 
   try {
-    if (
-      event.event_type === "NodeChildrenChanged" &&
-      tab.expandedKeys.includes(event.path)
-    ) {
+    if (event.event_type === "NodeChildrenChanged") {
+      // ZooKeeper watcher 是一次性的；折叠期间也要刷新并重新注册，避免再次展开时数据陈旧。
       await refreshChildren(tab, event.path);
     }
     if (
@@ -347,9 +517,8 @@ export async function handleNodeEvent(event: NodeEvent): Promise<void> {
       event.event_type === "NodeDeleted" &&
       tab.selectedPath === event.path
     ) {
-      tab.selectedPath = "";
-      tab.selectedNode = null;
-      tab.dataDraft = "";
+      // 外部删除当前选中节点：同样回上一级
+      await selectParentAfterDelete(tab, event.path);
     }
   } catch (error) {
     tab.error = String(error);

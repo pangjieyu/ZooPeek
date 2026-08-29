@@ -26,7 +26,7 @@ async fn smoke_connect_list_watch() {
     println!("root children = {:?}", root_children);
     assert!(root_children.iter().any(|c| c == "zookeeper"));
 
-    // 3. get_and_watch_children + 数据读取
+    // 3. get_and_watch_children + 数据读取（先写入再断言，保证测试幂等可重复）
     let (children, _stat, child_watcher) = client
         .get_and_watch_children("/zoopeek-test")
         .await
@@ -34,6 +34,14 @@ async fn smoke_connect_list_watch() {
     println!("/zoopeek-test children = {:?}", children);
     assert_eq!(children.len(), 2);
 
+    client
+        .set_data(
+            "/zoopeek-test/config",
+            b"{\"db\":{\"host\":\"10.0.0.1\",\"port\":3306}}",
+            None,
+        )
+        .await
+        .expect("reset config data failed");
     let (data, _stat) = client
         .get_data("/zoopeek-test/config")
         .await
@@ -43,7 +51,9 @@ async fn smoke_connect_list_watch() {
     assert!(data_str.contains("3306"));
 
     // 4. watcher 触发验证（children）：另一个客户端建子节点，应收到 NodeChildrenChanged
-    let writer = zk::Client::connect(CLUSTER).await.expect("writer connect failed");
+    let writer = zk::Client::connect(CLUSTER)
+        .await
+        .expect("writer connect failed");
     let create_options = zk::CreateMode::Persistent.with_acls(zk::Acls::anyone_all());
     writer
         .create("/zoopeek-test/newcomer", b"tmp", &create_options)
@@ -51,7 +61,10 @@ async fn smoke_connect_list_watch() {
         .expect("create failed");
 
     let event = child_watcher.changed().await;
-    println!("children event = {:?} path={}", event.event_type, event.path);
+    println!(
+        "children event = {:?} path={}",
+        event.event_type, event.path
+    );
     assert_eq!(event.event_type, zk::EventType::NodeChildrenChanged);
     assert_eq!(event.path, "/zoopeek-test");
 
