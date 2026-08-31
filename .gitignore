@@ -25,3 +25,6 @@ dist-ssr
 
 # Tauri 应用图标不能被全局 Icon? 规则吞掉
 !src-tauri/icons/
+
+# 本地 agent 会话状态
+.sisyphus/
