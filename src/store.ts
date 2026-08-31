@@ -3,10 +3,24 @@ import { reactive } from "vue";
 import type { TreeOption } from "naive-ui";
 import { ancestorPaths } from "./zk-path";
 
+export type AuthType = "none" | "digest" | "sasl_digest_md5";
+
 export interface SavedConnection {
   id: string;
   name: string;
   servers: string;
+  auth_type: AuthType;
+  username: string;
+  save_password: boolean;
+}
+
+export interface SaveConnectionResult {
+  password_saved: boolean;
+  keyring_available: boolean;
+}
+
+export interface KeyringStatus {
+  available: boolean;
 }
 
 export interface NodeDetail {
@@ -48,6 +62,9 @@ export interface ConnectionTab {
   id: string;
   name: string;
   servers: string;
+  authType: AuthType;
+  username: string;
+  savePassword: boolean;
   status: string;
   sessionId: string;
   error: string;
@@ -83,6 +100,36 @@ export const store = reactive({
 });
 
 let eventSequence = 0;
+type PasswordRequester = (connection: SavedConnection) => Promise<string | null>;
+let passwordRequester: PasswordRequester | null = null;
+const passwordFlights = new Map<string, Promise<string | null>>();
+
+const CONNECTION_ERROR = "无法连接，请检查地址和认证方式";
+const NO_AUTH_ERROR = "权限不足：密码可能不正确，或该账号无权访问此节点";
+
+export function setPasswordRequester(requester: PasswordRequester | null): void {
+  passwordRequester = requester;
+}
+
+async function requestPassword(connection: SavedConnection): Promise<string | null> {
+  const existing = passwordFlights.get(connection.id);
+  if (existing) return existing;
+  if (!passwordRequester) return null;
+  const flight = passwordRequester(connection).finally(() => {
+    passwordFlights.delete(connection.id);
+  });
+  passwordFlights.set(connection.id, flight);
+  return flight;
+}
+
+export function formatOperationError(error: unknown): string {
+  const message = String(error);
+  return message.includes("NO_AUTH") ? NO_AUTH_ERROR : message;
+}
+
+function isPasswordRequired(error: unknown): boolean {
+  return String(error).includes("PASSWORD_REQUIRED");
+}
 
 export function tabById(connId: string): ConnectionTab | undefined {
   return store.tabs.find((tab) => tab.id === connId);
@@ -156,10 +203,15 @@ export async function loadSavedConnections(): Promise<void> {
 }
 
 export async function saveConnection(
-  connection: SavedConnection
-): Promise<void> {
-  await invoke("save_connection", { connection });
+  connection: SavedConnection,
+  password?: string
+): Promise<SaveConnectionResult> {
+  const result = await invoke<SaveConnectionResult>("save_connection", {
+    connection,
+    password,
+  });
   await loadSavedConnections();
+  return result;
 }
 
 export async function deleteSavedConnection(id: string): Promise<void> {
@@ -183,7 +235,12 @@ export async function loadTreeNode(
   tab: ConnectionTab,
   option: TreeOption
 ): Promise<void> {
-  await refreshChildren(tab, String(option.key));
+  try {
+    await refreshChildren(tab, String(option.key));
+  } catch (error) {
+    tab.error = formatOperationError(error);
+    throw error;
+  }
 }
 
 export function updateExpandedKeys(
@@ -241,7 +298,7 @@ export async function selectNode(
       tab.newAcl = newAclEntry();
       tab.aclLoading = false;
     } else {
-      tab.error = String(error);
+      tab.error = formatOperationError(error);
     }
   } finally {
     if (tab.selectedPath === path) tab.aclLoading = false;
@@ -296,7 +353,7 @@ export async function saveNodeAcl(tab: ConnectionTab): Promise<void> {
     });
     appendEvent(tab, `已保存 ACL：${path}`);
   } catch (error) {
-    tab.error = String(error);
+    tab.error = formatOperationError(error);
   } finally {
     tab.aclSaving = false;
   }
@@ -377,7 +434,7 @@ export async function saveNodeData(tab: ConnectionTab): Promise<void> {
     appendEvent(tab, `已保存节点数据：${tab.selectedPath}`);
     await selectNode(tab, [tab.selectedPath]);
   } catch (error) {
-    tab.error = String(error);
+    tab.error = formatOperationError(error);
   } finally {
     tab.saving = false;
   }
@@ -393,7 +450,8 @@ export function formatJsonDraft(tab: ConnectionTab): void {
 }
 
 export async function openConnection(
-  connection: SavedConnection
+  connection: SavedConnection,
+  suppliedPassword?: string
 ): Promise<void> {
   let tab = tabById(connection.id);
   if (!tab) {
@@ -401,6 +459,9 @@ export async function openConnection(
       id: connection.id,
       name: connection.name,
       servers: connection.servers,
+      authType: connection.auth_type,
+      username: connection.username,
+      savePassword: connection.save_password,
       status: "Disconnected",
       sessionId: "",
       error: "",
@@ -438,6 +499,9 @@ export async function openConnection(
   tab.error = "";
   tab.name = connection.name;
   tab.servers = connection.servers;
+  tab.authType = connection.auth_type;
+  tab.username = connection.username;
+  tab.savePassword = connection.save_password;
   tab.tree = [
     {
       key: "/",
@@ -454,18 +518,46 @@ export async function openConnection(
   tab.newAcl = newAclEntry();
   tab.aclLoading = false;
   appendEvent(tab, `正在连接 ${connection.servers}`);
-  try {
-    const result = await invoke<{ session_id: string }>("connect", {
-      connId: tab.id,
-      servers: tab.servers,
+  const connectWithPassword = (password?: string) =>
+    invoke<{ session_id: string }>("connect", {
+      request: {
+        connId: tab.id,
+        servers: tab.servers,
+        authType: tab.authType,
+        username: tab.username,
+        savePassword: tab.savePassword,
+        password,
+      },
     });
-    tab.sessionId = result.session_id;
-    appendEvent(tab, `连接成功，session id = ${result.session_id}`);
-    await refreshChildren(tab, "/");
+
+  let result: { session_id: string };
+  try {
+    try {
+      result = await connectWithPassword(suppliedPassword);
+    } catch (error) {
+      if (!isPasswordRequired(error)) throw error;
+      const password = await requestPassword(connection);
+      if (password === null) {
+        tab.status = "WaitingForManualReconnect";
+        appendEvent(tab, "已取消密码输入，等待手动重连");
+        return;
+      }
+      result = await connectWithPassword(password);
+    }
   } catch (error) {
     tab.status = "Disconnected";
-    tab.error = String(error);
-    appendEvent(tab, `连接失败：${String(error)}`);
+    tab.error = CONNECTION_ERROR;
+    appendEvent(tab, `连接失败：${CONNECTION_ERROR}`);
+    return;
+  }
+
+  tab.sessionId = result.session_id;
+  appendEvent(tab, `连接成功，session id = ${result.session_id}`);
+  try {
+    await refreshChildren(tab, "/");
+  } catch (error) {
+    tab.error = formatOperationError(error);
+    appendEvent(tab, `读取根节点失败：${tab.error}`);
   }
 }
 
@@ -475,9 +567,10 @@ export async function disconnectConnection(tab: ConnectionTab): Promise<void> {
     await invoke("disconnect", { connId: tab.id });
     appendEvent(tab, "已主动断开连接");
   } catch (error) {
-    tab.error = String(error);
+    tab.error = formatOperationError(error);
   } finally {
     tab.status = "Disconnected";
+    tab.sessionId = "";
   }
 }
 
@@ -498,6 +591,10 @@ export async function handleSessionState(
   if (!tab) return;
   tab.status = event.state;
   appendEvent(tab, `会话状态：${event.state}`);
+  if (event.state === "Expired") tab.sessionId = "";
+  if (event.state === "ReconnectFailed") {
+    tab.error = CONNECTION_ERROR;
+  }
 }
 
 export async function handleNodeEvent(event: NodeEvent): Promise<void> {
@@ -527,6 +624,6 @@ export async function handleNodeEvent(event: NodeEvent): Promise<void> {
       await selectAncestorAfterDelete(tab, event.path);
     }
   } catch (error) {
-    tab.error = String(error);
+    tab.error = formatOperationError(error);
   }
 }

@@ -1,4 +1,5 @@
 <script setup lang="ts">
+import { invoke } from "@tauri-apps/api/core";
 import { nextTick, onMounted, onUnmounted, reactive, ref } from "vue";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import {
@@ -39,6 +40,7 @@ import {
   deleteTreeNode,
   deleteSavedConnection,
   disconnectConnection,
+  formatOperationError,
   formatJsonDraft,
   handleNodeEvent,
   handleSessionState,
@@ -51,20 +53,127 @@ import {
   saveNodeAcl,
   saveNodeData,
   selectNode,
+  setPasswordRequester,
   store,
   tabById,
   updateExpandedKeys,
+  type AuthType,
   type ConnectionTab,
+  type KeyringStatus,
   type NodeEvent,
   type SavedConnection,
   type SessionStateEvent,
 } from "./store";
 
 const showNewConnection = ref(false);
+const editingConnectionId = ref("");
 const modalError = ref("");
+const modalInfo = ref("");
+const testingConnection = ref(false);
+const keyringAvailable = ref(true);
 const appError = ref("");
-const newConnection = reactive({ name: "", servers: "127.0.0.1:2181" });
+const newConnection = reactive({
+  name: "",
+  servers: "127.0.0.1:2181",
+  authType: "none" as AuthType,
+  username: "",
+  password: "",
+  savePassword: true,
+});
 const unlisteners: UnlistenFn[] = [];
+
+const authTypeOptions = [
+  { label: "无", value: "none" },
+  { label: "digest", value: "digest" },
+  { label: "SASL DIGEST-MD5", value: "sasl_digest_md5" },
+];
+
+const showPasswordPrompt = ref(false);
+const passwordPrompt = reactive({
+  connectionName: "",
+  password: "",
+});
+interface PasswordPromptRequest {
+  connection: SavedConnection;
+  resolve: (password: string | null) => void;
+}
+const passwordPromptQueue: PasswordPromptRequest[] = [];
+let activePasswordPrompt: PasswordPromptRequest | null = null;
+
+function showNextPasswordPrompt(): void {
+  activePasswordPrompt = passwordPromptQueue.shift() ?? null;
+  if (!activePasswordPrompt) {
+    showPasswordPrompt.value = false;
+    return;
+  }
+  passwordPrompt.connectionName = activePasswordPrompt.connection.name;
+  passwordPrompt.password = "";
+  showPasswordPrompt.value = true;
+}
+
+function requestConnectionPassword(
+  connection: SavedConnection
+): Promise<string | null> {
+  return new Promise((resolve) => {
+    passwordPromptQueue.push({ connection, resolve });
+    if (!activePasswordPrompt) showNextPasswordPrompt();
+  });
+}
+
+function finishPasswordPrompt(password: string | null): void {
+  const request = activePasswordPrompt;
+  if (!request) return;
+  activePasswordPrompt = null;
+  showPasswordPrompt.value = false;
+  passwordPrompt.password = "";
+  request.resolve(password);
+  showNextPasswordPrompt();
+}
+
+function submitPasswordPrompt(): void {
+  if (!passwordPrompt.password) return;
+  finishPasswordPrompt(passwordPrompt.password);
+}
+
+function resetConnectionForm(): void {
+  editingConnectionId.value = "";
+  newConnection.name = "";
+  newConnection.servers = "127.0.0.1:2181";
+  newConnection.authType = "none";
+  newConnection.username = "";
+  newConnection.password = "";
+  newConnection.savePassword = true;
+  modalError.value = "";
+  modalInfo.value = "";
+}
+
+async function openNewConnectionModal(): Promise<void> {
+  resetConnectionForm();
+  showNewConnection.value = true;
+  try {
+    const status = await invoke<KeyringStatus>("keyring_status");
+    keyringAvailable.value = status.available;
+  } catch {
+    keyringAvailable.value = false;
+  }
+}
+
+async function openEditConnectionModal(connection: SavedConnection): Promise<void> {
+  resetConnectionForm();
+  editingConnectionId.value = connection.id;
+  newConnection.name = connection.name;
+  newConnection.servers = connection.servers;
+  newConnection.authType = connection.auth_type;
+  newConnection.username = connection.username;
+  newConnection.savePassword = connection.save_password;
+  showNewConnection.value = true;
+  try {
+    const status = await invoke<KeyringStatus>("keyring_status");
+    keyringAvailable.value = status.available;
+  } catch {
+    keyringAvailable.value = false;
+  }
+}
 
 const treeMenu = reactive({
   show: false,
@@ -103,6 +212,8 @@ const statusLabels: Record<string, string> = {
   AuthFailed: "认证失败",
   Closed: "已关闭",
   SaslAuthenticated: "SASL 已认证",
+  WaitingForManualReconnect: "等待手动重连",
+  ReconnectFailed: "重连失败",
 };
 
 function statusLabel(status: string): string {
@@ -117,32 +228,107 @@ function statusType(
   if (status === "ConnectedReadOnly" || status === "SaslAuthenticated") {
     return "info";
   }
-  if (status === "Expired" || status === "AuthFailed") return "error";
+  if (
+    status === "Expired" ||
+    status === "AuthFailed" ||
+    status === "ReconnectFailed"
+  ) {
+    return "error";
+  }
+  if (status === "WaitingForManualReconnect") return "warning";
   return "default";
 }
 
 async function createConnection(): Promise<void> {
   modalError.value = "";
+  modalInfo.value = "";
   const name = newConnection.name.trim();
   const servers = newConnection.servers.trim();
   if (!name || !servers) {
     modalError.value = "名称和地址不能为空";
     return;
   }
+  const authenticated = newConnection.authType !== "none";
+  const username = newConnection.username.trim();
+  const existing = editingConnectionId.value
+    ? store.savedConnections.find((item) => item.id === editingConnectionId.value)
+    : undefined;
+  const canReuseSavedPassword = Boolean(
+    existing?.save_password &&
+    existing.auth_type === newConnection.authType &&
+    existing.username === username
+  );
+  if (
+    authenticated &&
+    (!username || (!newConnection.password && !canReuseSavedPassword))
+  ) {
+    modalError.value = canReuseSavedPassword
+      ? "用户名不能为空"
+      : "用户名和密码不能为空";
+    return;
+  }
   const connection: SavedConnection = {
     id:
-      globalThis.crypto?.randomUUID?.() ??
-      `connection-${Date.now().toString(36)}`,
+      editingConnectionId.value ||
+      (globalThis.crypto?.randomUUID?.() ??
+        `connection-${Date.now().toString(36)}`),
     name,
     servers,
+    auth_type: newConnection.authType,
+    username: authenticated ? username : "",
+    save_password: authenticated && newConnection.savePassword,
   };
+  const password = authenticated && newConnection.password
+    ? newConnection.password
+    : undefined;
   try {
-    await saveConnection(connection);
+    const result = await saveConnection(connection, password);
+    if (connection.save_password && !result.password_saved) {
+      keyringAvailable.value = false;
+    }
     showNewConnection.value = false;
-    newConnection.name = "";
-    await openConnection(connection);
+    newConnection.password = "";
+    const openTab = tabById(connection.id);
+    if (openTab) await disconnectConnection(openTab);
+    await openConnection(connection, password);
+    resetConnectionForm();
   } catch (error) {
     modalError.value = String(error);
+  }
+}
+
+async function testNewConnection(): Promise<void> {
+  modalError.value = "";
+  modalInfo.value = "";
+  const servers = newConnection.servers.trim();
+  const authenticated = newConnection.authType !== "none";
+  const username = newConnection.username.trim();
+  if (!servers) {
+    modalError.value = "地址不能为空";
+    return;
+  }
+  if (authenticated && (!username || !newConnection.password)) {
+    modalError.value = "用户名和密码不能为空";
+    return;
+  }
+  testingConnection.value = true;
+  try {
+    await invoke("test_connection", {
+      servers,
+      authType: newConnection.authType,
+      username: authenticated ? username : "",
+      password: authenticated ? newConnection.password : undefined,
+    });
+    modalInfo.value = authenticated
+      ? "连接已建立；凭证将在访问受限节点时继续验证"
+      : "连接测试成功";
+  } catch (error) {
+    const friendly = formatOperationError(error);
+    modalError.value = friendly === String(error)
+      ? "无法连接，请检查地址和认证方式"
+      : friendly;
+  } finally {
+    testingConnection.value = false;
   }
 }
 
@@ -201,7 +387,7 @@ async function handleTreeMenuSelect(key: string | number): Promise<void> {
       deleteTarget.recursive = children.length > 0;
       showDeleteNode.value = true;
     } catch (error) {
-      tab.error = String(error);
+      tab.error = formatOperationError(error);
     }
   }
 }
@@ -220,7 +406,7 @@ async function submitNewNode(): Promise<void> {
     await createChildNode(tab, newNode.parentPath, name, newNode.data);
     showNewNode.value = false;
   } catch (error) {
-    nodeModalError.value = String(error);
+    nodeModalError.value = formatOperationError(error);
   } finally {
     creatingNode.value = false;
   }
@@ -239,7 +425,7 @@ async function confirmDeleteNode(): Promise<void> {
     );
     showDeleteNode.value = false;
   } catch (error) {
-    tab.error = String(error);
+    tab.error = formatOperationError(error);
     showDeleteNode.value = false;
   } finally {
     deletingNode.value = false;
@@ -259,6 +445,7 @@ function aclPermissionLabel(permission: number): string {
 }
 
 onMounted(async () => {
+  setPasswordRequester(requestConnectionPassword);
   try {
     unlisteners.push(
       await listen<SessionStateEvent>("zk-session-state", (event) => {
@@ -275,6 +462,10 @@ onMounted(async () => {
 });
 
 onUnmounted(() => {
+  setPasswordRequester(null);
+  activePasswordPrompt?.resolve(null);
+  activePasswordPrompt = null;
+  for (const request of passwordPromptQueue.splice(0)) request.resolve(null);
   unlisteners.forEach((unlisten) => unlisten());
 });
 </script>
@@ -288,7 +479,7 @@ onUnmounted(() => {
             <div class="brand">ZooPeek</div>
             <n-text depth="3">ZooKeeper 客户端</n-text>
           </div>
-          <n-button type="primary" size="small" @click="showNewConnection = true">
+          <n-button type="primary" size="small" @click="openNewConnectionModal">
             新建
           </n-button>
         </div>
@@ -310,16 +501,21 @@ onUnmounted(() => {
                 <n-text depth="3">{{ connection.servers }}</n-text>
               </div>
               <template #suffix>
-                <n-popconfirm
-                  positive-text="删除"
-                  negative-text="取消"
-                  @positive-click="removeSavedConnection(connection.id)"
-                >
-                  <template #trigger>
-                    <n-button text type="error" @click.stop>删除</n-button>
-                  </template>
-                  删除这个连接配置？已打开的连接不会关闭。
-                </n-popconfirm>
+                <n-space size="small">
+                  <n-button text @click.stop="openEditConnectionModal(connection)">
+                    编辑
+                  </n-button>
+                  <n-popconfirm
+                    positive-text="删除"
+                    negative-text="取消"
+                    @positive-click="removeSavedConnection(connection.id)"
+                  >
+                    <template #trigger>
+                      <n-button text type="error" @click.stop>删除</n-button>
+                    </template>
+                    删除这个连接配置？已打开的连接不会关闭。
+                  </n-popconfirm>
+                </n-space>
               </template>
             </n-list-item>
           </n-list>
@@ -555,8 +751,9 @@ onUnmounted(() => {
     <n-modal
       v-model:show="showNewConnection"
       preset="card"
-      title="新建连接"
+      :title="editingConnectionId ? '编辑连接' : '新建连接'"
       :style="{ width: '480px' }"
+      @after-leave="newConnection.password = ''"
     >
       <n-form label-placement="top">
         <n-form-item label="连接名称" required>
@@ -568,12 +765,98 @@ onUnmounted(() => {
             placeholder="127.0.0.1:2181"
           />
         </n-form-item>
+        <n-form-item label="认证类型">
+          <n-select
+            v-model:value="newConnection.authType"
+            :options="authTypeOptions"
+          />
+        </n-form-item>
+        <template v-if="newConnection.authType !== 'none'">
+          <n-form-item label="用户名" required>
+            <n-input
+              v-model:value="newConnection.username"
+              autocomplete="username"
+              placeholder="用户名"
+            />
+          </n-form-item>
+          <n-form-item label="密码" required>
+            <n-input
+              v-model:value="newConnection.password"
+              type="password"
+              show-password-on="click"
+              autocomplete="new-password"
+              :placeholder="editingConnectionId ? '留空则沿用已保存密码' : '密码'"
+            />
+          </n-form-item>
+          <n-form-item :show-feedback="false">
+            <n-checkbox v-model:checked="newConnection.savePassword">
+              保存到系统钥匙串
+            </n-checkbox>
+          </n-form-item>
+          <div
+            v-if="newConnection.savePassword && !keyringAvailable"
+            class="auth-hint"
+          >
+            当前系统不支持安全存储，密码将不会被保存
+          </div>
+          <div class="auth-hint">
+            {{
+              newConnection.authType === "digest"
+                ? "digest 认证不加密传输，建议仅在可信网络使用"
+                : "该方式已过时，仅在服务端要求时使用"
+            }}
+          </div>
+        </template>
         <n-alert v-if="modalError" type="error">{{ modalError }}</n-alert>
+        <n-alert v-if="modalInfo" type="info">{{ modalInfo }}</n-alert>
+      </n-form>
+      <template #footer>
+        <n-space justify="space-between">
+          <n-button :loading="testingConnection" @click="testNewConnection">
+            测试连接
+          </n-button>
+          <n-space>
+            <n-button @click="showNewConnection = false">取消</n-button>
+            <n-button type="primary" @click="createConnection">
+              {{ editingConnectionId ? "保存并重连" : "保存并连接" }}
+            </n-button>
+          </n-space>
+        </n-space>
+      </template>
+    </n-modal>
+
+    <n-modal
+      v-model:show="showPasswordPrompt"
+      preset="card"
+      title="输入连接密码"
+      :style="{ width: '420px' }"
+      :mask-closable="false"
+      :close-on-esc="false"
+      :closable="false"
+    >
+      <n-form label-placement="top" @submit.prevent="submitPasswordPrompt">
+        <n-form-item :label="passwordPrompt.connectionName" required>
+          <n-input
+            v-model:value="passwordPrompt.password"
+            type="password"
+            show-password-on="click"
+            autocomplete="current-password"
+            autofocus
+            placeholder="密码"
+            @keyup.enter="submitPasswordPrompt"
+          />
+        </n-form-item>
       </n-form>
       <template #footer>
         <n-space justify="end">
-          <n-button @click="showNewConnection = false">取消</n-button>
-          <n-button type="primary" @click="createConnection">保存并连接</n-button>
+          <n-button @click="finishPasswordPrompt(null)">取消</n-button>
+          <n-button
+            type="primary"
+            :disabled="!passwordPrompt.password"
+            @click="submitPasswordPrompt"
+          >
+            连接
+          </n-button>
         </n-space>
       </template>
     </n-modal>
@@ -894,5 +1177,12 @@ body {
   display: grid;
   height: 100%;
   place-items: center;
+}
+
+.auth-hint {
+  margin: 8px 0;
+  color: rgba(255, 255, 255, 0.58);
+  font-size: 12px;
+  line-height: 1.5;
 }
 </style>
