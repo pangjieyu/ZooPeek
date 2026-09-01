@@ -1,3 +1,5 @@
+pub mod search;
+
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -49,6 +51,7 @@ struct ConnectionManager {
     watchers: Arc<Mutex<HashMap<WatchKey, JoinHandle<()>>>>,
     session_watchers: Arc<Mutex<HashMap<String, JoinHandle<()>>>>,
     active_connections: Arc<Mutex<HashMap<String, ActiveConnection>>>,
+    search_manager: search::SearchManager,
 }
 
 impl ConnectionManager {
@@ -58,6 +61,7 @@ impl ConnectionManager {
             watchers: Arc::new(Mutex::new(HashMap::new())),
             session_watchers: Arc::new(Mutex::new(HashMap::new())),
             active_connections: Arc::new(Mutex::new(HashMap::new())),
+            search_manager: search::SearchManager::new(),
         }
     }
 
@@ -306,6 +310,7 @@ fn install_client(
         .lock()
         .map_err(|error| error.to_string())?
         .insert(conn_id.clone(), spec);
+    manager.search_manager.install_connection(&conn_id)?;
 
     let current_state = state_watcher.state();
     emit_session_state(&app, &conn_id, &format!("{current_state:?}"));
@@ -328,6 +333,9 @@ fn install_client(
                 if let Ok(mut clients) = watcher_manager.clients.lock() {
                     clients.remove(&watcher_conn_id);
                 }
+                let _ = watcher_manager
+                    .search_manager
+                    .remove_connection(&watcher_conn_id);
 
                 if state == zk::SessionState::Expired {
                     emit_session_state(&app_handle, &watcher_conn_id, "Connecting");
@@ -467,6 +475,7 @@ async fn test_connection(
 #[tauri::command]
 fn disconnect(manager: State<'_, ConnectionManager>, conn_id: String) -> Result<(), String> {
     manager.cancel_tasks(&conn_id)?;
+    manager.search_manager.remove_connection(&conn_id)?;
     manager
         .clients
         .lock()
@@ -490,6 +499,45 @@ async fn list_children(
     let mut children = client.list_children(&path).await.map_err(zk_error)?;
     children.sort();
     Ok(children)
+}
+
+#[tauri::command]
+fn start_search_index(
+    app: AppHandle,
+    manager: State<'_, ConnectionManager>,
+    conn_id: String,
+    force: bool,
+) -> Result<search::SearchIndexTicket, String> {
+    let client = manager.client(&conn_id)?;
+    search::start_index_build(app, manager.search_manager.clone(), client, conn_id, force)
+}
+
+#[tauri::command]
+fn get_search_index_status(
+    manager: State<'_, ConnectionManager>,
+    conn_id: String,
+) -> Result<search::SearchIndexStatus, String> {
+    manager.search_manager.status(&conn_id)
+}
+
+#[tauri::command]
+fn cancel_search_index(
+    manager: State<'_, ConnectionManager>,
+    conn_id: String,
+    connection_epoch: u64,
+    generation: u64,
+) -> Result<(), String> {
+    manager
+        .search_manager
+        .cancel_build(&conn_id, connection_epoch, generation)
+}
+
+#[tauri::command]
+async fn search_nodes(
+    manager: State<'_, ConnectionManager>,
+    request: search::SearchRequest,
+) -> Result<search::SearchResponse, String> {
+    search::search_snapshot(manager.search_manager.clone(), request).await
 }
 
 #[tauri::command]
@@ -542,6 +590,7 @@ async fn create_node(
         .create(&path, data.as_bytes(), &options)
         .await
         .map_err(zk_error)?;
+    manager.search_manager.mark_dirty(&conn_id)?;
     Ok(())
 }
 
@@ -560,6 +609,7 @@ async fn delete_node(
         return Err("节点存在子节点，不能直接删除".to_string());
     }
     client.delete(&path, None).await.map_err(zk_error)?;
+    manager.search_manager.mark_dirty(&conn_id)?;
     Ok(())
 }
 
@@ -624,7 +674,9 @@ async fn delete_node_recursive(
         return Err("不能删除根节点".to_string());
     }
     let client = manager.client(&conn_id)?;
-    delete_node_tree(&client, &path).await
+    let deleted = delete_node_tree(&client, &path).await?;
+    manager.search_manager.mark_dirty(&conn_id)?;
+    Ok(deleted)
 }
 
 #[tauri::command]
@@ -694,8 +746,26 @@ async fn watch_children(
         path: path.clone(),
         kind: WatchKind::Children,
     };
+    let search_manager = manager.search_manager.clone();
+    let search_app = app.clone();
     let task = tauri::async_runtime::spawn(async move {
         let event = watcher.changed().await;
+        // 已安装的 watcher 命中说明远端结构发生变化，节点搜索快照需要标记为脏。
+        // mark_dirty 内部对没有快照的连接是 no-op，不会让 dirty=true 出现于尚未构建完成的连接。
+        let _ = search_manager.mark_dirty(&conn_id);
+        if let Ok(status) = search_manager.status(&conn_id) {
+            let _ = search_app.emit(
+                "zk-search-index-state",
+                search::SearchIndexStateEvent {
+                    conn_id: conn_id.clone(),
+                    connection_epoch: status.connection_epoch,
+                    generation: status.generation,
+                    state: status.state,
+                    dirty: status.dirty,
+                    stats: status.stats.clone(),
+                },
+            );
+        }
         let _ = app.emit(
             "zk-node-event",
             NodeEvent {
@@ -725,8 +795,24 @@ async fn watch_data(
         path: path.clone(),
         kind: WatchKind::Data,
     };
+    let search_manager = manager.search_manager.clone();
+    let search_app = app.clone();
     let task = tauri::async_runtime::spawn(async move {
         let event = watcher.changed().await;
+        let _ = search_manager.mark_dirty(&conn_id);
+        if let Ok(status) = search_manager.status(&conn_id) {
+            let _ = search_app.emit(
+                "zk-search-index-state",
+                search::SearchIndexStateEvent {
+                    conn_id: conn_id.clone(),
+                    connection_epoch: status.connection_epoch,
+                    generation: status.generation,
+                    state: status.state,
+                    dirty: status.dirty,
+                    stats: status.stats.clone(),
+                },
+            );
+        }
         let _ = app.emit(
             "zk-node-event",
             NodeEvent {
@@ -845,6 +931,10 @@ pub fn run() {
             test_connection,
             disconnect,
             list_children,
+            start_search_index,
+            get_search_index_status,
+            cancel_search_index,
+            search_nodes,
             get_node,
             set_data,
             create_node,
