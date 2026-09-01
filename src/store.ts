@@ -1,7 +1,19 @@
 import { invoke } from "@tauri-apps/api/core";
-import { reactive } from "vue";
+import { nextTick, reactive } from "vue";
 import type { TreeOption } from "naive-ui";
-import { ancestorPaths } from "./zk-path";
+import { ancestorPaths, pathChain, validateZkPath } from "./zk-path.ts";
+import type {
+  SearchIndexStateEvent,
+  SearchIndexStatus,
+  SearchResult,
+  SearchResponse,
+} from "./zk-search.ts";
+import {
+  cancelSearchIndex as cancelSearchIndexApi,
+  getSearchIndexStatus as getSearchIndexStatusApi,
+  searchNodes as searchNodesApi,
+  startSearchIndex as startSearchIndexApi,
+} from "./zk-search.ts";
 
 export type AuthType = "none" | "digest" | "sasl_digest_md5";
 
@@ -79,6 +91,16 @@ export interface ConnectionTab {
   aclLoading: boolean;
   aclSaving: boolean;
   events: EventItem[];
+  // --- 搜索状态（Rust 侧的 search directory 镜像，Vue 中仅保存轻量快照） ---
+  searchIndexStatus: SearchIndexStatus | null;
+  searchQuery: string;
+  searchScopePath: string;
+  searchResults: SearchResult[];
+  searchTotalMatches: number;
+  searchQuerySeq: number;
+  searchLoading: boolean;
+  searchError: string;
+  revealSeq: number;
 }
 
 export interface NodeEvent {
@@ -129,6 +151,16 @@ export function formatOperationError(error: unknown): string {
 
 function isPasswordRequired(error: unknown): boolean {
   return String(error).includes("PASSWORD_REQUIRED");
+}
+
+export function canLoadTree(status: string): boolean {
+  return status === "SyncConnected" || status === "ConnectedReadOnly";
+}
+
+// 连接刚建立/重建的同步窗口内，后端句柄可能尚未就绪，这类错误会随重试自愈，不应当作失败展示
+function isTransientConnectionError(error: unknown): boolean {
+  const message = String(error);
+  return message.includes("不存在或已断开") || message.includes("ConnectionLoss");
 }
 
 export function tabById(connId: string): ConnectionTab | undefined {
@@ -235,9 +267,18 @@ export async function loadTreeNode(
   tab: ConnectionTab,
   option: TreeOption
 ): Promise<void> {
+  // 连接未就绪时（如 connect 进行中 n-tree 自动触发 on-load）不打扰后端，
+  // openConnection 会在连接成功后显式刷新根节点
+  if (tab.status !== "SyncConnected" && tab.status !== "ConnectedReadOnly") {
+    return;
+  }
   try {
     await refreshChildren(tab, String(option.key));
   } catch (error) {
+    if (isTransientConnectionError(error)) {
+      appendEvent(tab, `加载子节点失败（连接同步中，已忽略）：${String(error)}`);
+      return;
+    }
     tab.error = formatOperationError(error);
     throw error;
   }
@@ -297,6 +338,9 @@ export async function selectNode(
       tab.aclDraft = [];
       tab.newAcl = newAclEntry();
       tab.aclLoading = false;
+    } else if (isTransientConnectionError(error)) {
+      // 重连窗口内的瞬态失败，仅记录事件，等待会话恢复后用户重新选择
+      appendEvent(tab, `读取节点详情失败（连接同步中，已忽略）：${String(error)}`);
     } else {
       tab.error = formatOperationError(error);
     }
@@ -372,6 +416,10 @@ export async function createChildNode(
     data,
   });
   appendEvent(tab, `已新建节点：${childPath(parentPath, name)}`);
+  // 本端创建会使搜索快照变脏（后端已 mark_dirty，未建索引时为 no-op）
+  if (tab.searchIndexStatus) {
+    tab.searchIndexStatus.dirty = true;
+  }
 }
 
 export async function listNodeChildren(
@@ -410,6 +458,9 @@ export async function deleteTreeNode(
     ? await invoke<number>("delete_node_recursive", { connId: tab.id, path })
     : await invoke("delete_node", { connId: tab.id, path }).then(() => 1);
   appendEvent(tab, `已删除节点：${path}（共 ${deleted} 个）`);
+  if (tab.searchIndexStatus) {
+    tab.searchIndexStatus.dirty = true;
+  }
   if (shouldSelectParent) {
     await selectAncestorAfterDelete(tab, path);
   }
@@ -483,6 +534,15 @@ export async function openConnection(
       aclLoading: false,
       aclSaving: false,
       events: [],
+      searchIndexStatus: null,
+      searchQuery: "",
+      searchScopePath: "/",
+      searchResults: [],
+      searchTotalMatches: 0,
+      searchQuerySeq: 0,
+      searchLoading: false,
+      searchError: "",
+      revealSeq: 0,
     });
     store.tabs.push(tab);
   }
@@ -517,6 +577,15 @@ export async function openConnection(
   tab.aclDraft = [];
   tab.newAcl = newAclEntry();
   tab.aclLoading = false;
+  // 连接重置时同步重置搜索状态（epoch 已变化，旧快照失效）
+  tab.searchIndexStatus = null;
+  tab.searchQuery = "";
+  tab.searchResults = [];
+  tab.searchTotalMatches = 0;
+  tab.searchQuerySeq = 0;
+  tab.searchLoading = false;
+  tab.searchError = "";
+  tab.revealSeq += 1;
   appendEvent(tab, `正在连接 ${connection.servers}`);
   const connectWithPassword = (password?: string) =>
     invoke<{ session_id: string }>("connect", {
@@ -553,11 +622,27 @@ export async function openConnection(
 
   tab.sessionId = result.session_id;
   appendEvent(tab, `连接成功，session id = ${result.session_id}`);
-  try {
-    await refreshChildren(tab, "/");
-  } catch (error) {
-    tab.error = formatOperationError(error);
-    appendEvent(tab, `读取根节点失败：${tab.error}`);
+  // 刚连上时后端句柄可能有同步延迟，瞬态失败做有限重试，不以红条误导用户
+  for (let attempt = 1; ; attempt++) {
+    try {
+      await refreshChildren(tab, "/");
+      break;
+    } catch (error) {
+      if (isTransientConnectionError(error)) {
+        if (attempt < 3 && tab.status !== "Disconnected") {
+          await new Promise((resolve) => setTimeout(resolve, 300));
+          continue;
+        }
+        appendEvent(
+          tab,
+          `读取根节点失败（连接同步中，已重试 ${attempt} 次）：${String(error)}`
+        );
+      } else {
+        tab.error = formatOperationError(error);
+        appendEvent(tab, `读取根节点失败：${tab.error}`);
+      }
+      break;
+    }
   }
 }
 
@@ -571,6 +656,11 @@ export async function disconnectConnection(tab: ConnectionTab): Promise<void> {
   } finally {
     tab.status = "Disconnected";
     tab.sessionId = "";
+    tab.searchIndexStatus = null;
+    tab.searchResults = [];
+    tab.searchTotalMatches = 0;
+    tab.searchError = "";
+    tab.revealSeq += 1;
   }
 }
 
@@ -591,9 +681,17 @@ export async function handleSessionState(
   if (!tab) return;
   tab.status = event.state;
   appendEvent(tab, `会话状态：${event.state}`);
-  if (event.state === "Expired") tab.sessionId = "";
+  if (event.state === "Expired") {
+    tab.sessionId = "";
+    tab.searchIndexStatus = null;
+    tab.revealSeq += 1;
+  }
   if (event.state === "ReconnectFailed") {
     tab.error = CONNECTION_ERROR;
+  }
+  if (event.state === "Closed" || event.state === "AuthFailed") {
+    tab.searchIndexStatus = null;
+    tab.revealSeq += 1;
   }
 }
 
@@ -624,6 +722,263 @@ export async function handleNodeEvent(event: NodeEvent): Promise<void> {
       await selectAncestorAfterDelete(tab, event.path);
     }
   } catch (error) {
-    tab.error = formatOperationError(error);
+    if (isTransientConnectionError(error)) {
+      appendEvent(tab, `节点事件刷新失败（已忽略）：${String(error)}`);
+    } else {
+      tab.error = formatOperationError(error);
+    }
   }
 }
+
+// ── 搜索：索引生命周期与本地查询 ───────────────────────────────
+
+function isNoAuthError(error: unknown): boolean {
+  return String(error).includes("NO_AUTH");
+}
+
+export function handleSearchIndexState(event: SearchIndexStateEvent): void {
+  const tab = tabById(event.conn_id);
+  if (!tab) return;
+  const prev = tab.searchIndexStatus;
+  // 后端事件不含 built_at_ms/refreshing，基于 prev 做乐观更新，最终以 refreshSearchStatus 校准
+  const isBuilding = event.state === "building";
+  const hadSnapshot = prev !== null && prev.state !== "empty";
+  tab.searchIndexStatus = {
+    connection_epoch: event.connection_epoch,
+    generation: event.generation,
+    state: event.state,
+    dirty: event.dirty,
+    refreshing: isBuilding && hadSnapshot,
+    built_at_ms: prev?.built_at_ms ?? null,
+    stats: event.stats,
+  } as SearchIndexStatus;
+  if (event.state !== "building") {
+    // 完成/失败态，刷新一次权威状态以拿到 built_at_ms 与 refreshing
+    void refreshSearchStatus(tab).catch(() => {});
+  }
+  const stateLabel: Record<string, string> = {
+    building: "构建中",
+    ready: "就绪",
+    incomplete: "部分就绪",
+    truncated: "已截断",
+    failed: "失败",
+    cancelled: "已取消",
+    empty: "未构建",
+  };
+  appendEvent(
+    tab,
+    `搜索索引：${stateLabel[event.state] ?? event.state}${event.dirty ? "（已过期）" : ""}`
+  );
+}
+
+export async function refreshSearchStatus(tab: ConnectionTab): Promise<void> {
+  try {
+    const status = await getSearchIndexStatusApi(tab.id);
+    tab.searchIndexStatus = status;
+  } catch (error) {
+    // 连接不存在时后端返回错误，保留 null
+    if (String(error).includes("不存在或已断开")) {
+      tab.searchIndexStatus = null;
+    }
+  }
+}
+
+export async function startSearchIndex(
+  tab: ConnectionTab,
+  force = false
+): Promise<void> {
+  tab.searchError = "";
+  try {
+    const ticket = await startSearchIndexApi(tab.id, force);
+    // 乐观更新为 building，等待事件与 status 轮询校准
+    const prev = tab.searchIndexStatus;
+    tab.searchIndexStatus = {
+      connection_epoch: ticket.connection_epoch,
+      generation: ticket.generation,
+      state: ticket.state,
+      dirty: prev?.dirty ?? false,
+      refreshing: ticket.state === "building" && prev !== null && prev.state !== "empty",
+      built_at_ms: prev?.built_at_ms ?? null,
+      stats: prev?.stats ?? {
+        visited: 0,
+        inaccessible_subtrees: 0,
+        skipped_nodes: 0,
+        elapsed_ms: 0,
+        termination_reason: null,
+      },
+    };
+    appendEvent(
+      tab,
+      ticket.state === "building" ? "搜索索引：开始构建" : "搜索索引：无需重建"
+    );
+    // 拉取权威状态
+    await refreshSearchStatus(tab);
+  } catch (error) {
+    tab.searchError = formatOperationError(error);
+    appendEvent(tab, `搜索索引启动失败：${tab.searchError}`);
+    throw error;
+  }
+}
+
+export async function cancelSearchIndex(tab: ConnectionTab): Promise<void> {
+  const status = tab.searchIndexStatus;
+  if (!status) return;
+  try {
+    await cancelSearchIndexApi(tab.id, status.connection_epoch, status.generation);
+    appendEvent(tab, "搜索索引：已取消构建");
+    await refreshSearchStatus(tab);
+  } catch (error) {
+    tab.searchError = formatOperationError(error);
+  }
+}
+
+export async function searchInTab(
+  tab: ConnectionTab,
+  query: string,
+  limit = 50
+): Promise<void> {
+  const trimmed = query.trim();
+  tab.searchQuery = query;
+  if (trimmed.length === 0) {
+    tab.searchResults = [];
+    tab.searchTotalMatches = 0;
+    tab.searchError = "";
+    tab.searchLoading = false;
+    return;
+  }
+  // 作用域校验
+  if (!validateZkPath(tab.searchScopePath)) {
+    tab.searchError = "搜索范围不是合法的 ZooKeeper 路径";
+    return;
+  }
+  if (trimmed.includes("/") && !validateZkPath(trimmed)) {
+    tab.searchError = "路径查询不是合法的 ZooKeeper 路径";
+    return;
+  }
+  const status = tab.searchIndexStatus;
+  if (!status) {
+    tab.searchError = "索引未就绪，请先构建";
+    return;
+  }
+  const querySeq = ++tab.searchQuerySeq;
+  tab.searchLoading = true;
+  tab.searchError = "";
+  try {
+    const response: SearchResponse = await searchNodesApi({
+      connId: tab.id,
+      connectionEpoch: status.connection_epoch,
+      querySeq,
+      query: trimmed,
+      scopePath: tab.searchScopePath,
+      limit,
+    });
+    // 拒绝晚到的旧响应
+    if (querySeq !== tab.searchQuerySeq) return;
+    // 拒绝 epoch 已变化的响应
+    if (response.connection_epoch !== tab.searchIndexStatus?.connection_epoch) return;
+    tab.searchResults = response.results;
+    tab.searchTotalMatches = response.total_matches;
+    // 同步 dirty 与 snapshot_status
+    if (tab.searchIndexStatus) {
+      tab.searchIndexStatus.dirty = response.dirty;
+    }
+  } catch (error) {
+    if (querySeq !== tab.searchQuerySeq) return;
+    const msg = String(error);
+    if (msg.includes("INDEX_NOT_READY")) {
+      tab.searchError = "索引未就绪，请先构建";
+    } else if (msg.includes("SEARCH_CONNECTION_CHANGED")) {
+      tab.searchError = "连接已变化，索引已失效，请重建";
+      await refreshSearchStatus(tab);
+    } else {
+      tab.searchError = formatOperationError(error);
+    }
+    tab.searchResults = [];
+    tab.searchTotalMatches = 0;
+  } finally {
+    if (querySeq === tab.searchQuerySeq) {
+      tab.searchLoading = false;
+    }
+  }
+}
+
+// ── revealPath：按祖先逐层加载并滚动 ─────────────────────────────
+
+function isNoNodeLike(error: unknown): boolean {
+  return String(error).includes("node not exists") || String(error).includes("NoNode");
+}
+
+export async function revealPath(
+  tab: ConnectionTab,
+  targetPath: string
+): Promise<boolean> {
+  if (!validateZkPath(targetPath)) {
+    tab.error = "目标路径不是合法的 ZooKeeper 路径";
+    return false;
+  }
+  const revealSeq = (tab.revealSeq ?? 0) + 1;
+  tab.revealSeq = revealSeq;
+  // 捕获 epoch
+  let epoch = tab.searchIndexStatus?.connection_epoch ?? 0;
+  if (epoch === 0) {
+    try {
+      const s = await getSearchIndexStatusApi(tab.id);
+      tab.searchIndexStatus = s;
+      epoch = s.connection_epoch;
+    } catch {
+      epoch = 0;
+    }
+  }
+  const chain = pathChain(targetPath);
+  // 逐层确保祖先存在
+  for (let i = 1; i < chain.length; i++) {
+    if (tab.revealSeq !== revealSeq) return false;
+    if (epoch !== 0) {
+      try {
+        const cur = await getSearchIndexStatusApi(tab.id);
+        if (cur.connection_epoch !== epoch) return false;
+      } catch {
+        // 状态获取失败不阻断，仅在 epoch 明确变化时阻断
+      }
+    }
+    const desired = chain[i];
+    const parent = chain[i - 1];
+    const existing = findTreeNode(tab.tree, desired);
+    if (existing) {
+      if (!tab.expandedKeys.includes(parent)) {
+        tab.expandedKeys = [...tab.expandedKeys, parent];
+      }
+      continue;
+    }
+    // 父节点未展开或子节点未加载，刷新父节点
+    try {
+      await refreshChildren(tab, parent);
+    } catch (error) {
+      if (isNoNodeLike(error) || isNoAuthError(error)) {
+        tab.error = formatOperationError(error);
+        return false;
+      }
+      tab.error = formatOperationError(error);
+      return false;
+    }
+    // 刷新后再次确认
+    if (!findTreeNode(tab.tree, desired)) {
+      tab.error = `路径不存在：${desired}`;
+      return false;
+    }
+    if (!tab.expandedKeys.includes(parent)) {
+      tab.expandedKeys = [...tab.expandedKeys, parent];
+    }
+    if (tab.revealSeq !== revealSeq) return false;
+  }
+  // 确保所有祖先已展开
+  const ancestors = chain.slice(0, -1);
+  const expandedSet = new Set(tab.expandedKeys);
+  for (const p of ancestors) expandedSet.add(p);
+  tab.expandedKeys = Array.from(expandedSet);
+  // 选中目标
+  await selectNode(tab, [targetPath]);
+  await nextTick();
+  return true;
+}
+
